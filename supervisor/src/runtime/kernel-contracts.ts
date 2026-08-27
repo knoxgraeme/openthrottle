@@ -1,4 +1,5 @@
 import type {
+  AttemptEvidencePayload,
   AttemptCheckpoint,
   BlobPointer,
   CompiledPipelineStage,
@@ -17,10 +18,6 @@ export const KERNEL_RESULT_CORRECTION_REQUEST_SCHEMA =
   "openthrottle.kernel-result-correction-request/v2" as const;
 export const STAGED_SEMANTIC_CANDIDATE_SCHEMA =
   "openthrottle.staged-result-candidate/v1" as const;
-export const ATTEMPT_FORENSICS_PAYLOAD_SCHEMA =
-  "openthrottle.attempt-forensics/v1" as const;
-export const INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA =
-  "openthrottle.invalid-result-evidence/v1" as const;
 
 export interface KernelActionContext {
   records: readonly ExecutionRecord[];
@@ -156,7 +153,17 @@ export type KernelVerifiedActionResult =
 export interface KernelAttemptForensicsEvidence {
   blob: BlobPointer;
   operational_signature: string;
+  observed_at: string;
 }
+
+export interface KernelInvalidResultEvidence {
+  blob: BlobPointer;
+  observed_at: string;
+}
+
+export type KernelMaterializedArtifact =
+  | BlobPointer
+  | { blob: BlobPointer; evidence_payload: AttemptEvidencePayload };
 
 export type KernelRuntimeOutcome =
   | {
@@ -170,7 +177,7 @@ export type KernelRuntimeOutcome =
     candidate_hash: string | null;
     diagnostics: readonly { path: string; detail: string }[];
     correction_deadline: string;
-    invalid_result_evidence: BlobPointer;
+    invalid_result_evidence: KernelInvalidResultEvidence;
   }
   | {
     state: "work_failed";
@@ -191,6 +198,8 @@ export type KernelRuntimeOutcome =
 export interface KernelRuntimeLeaseCallbacks {
   /** Private live lease fence; this is deliberately absent from the public action request wire. */
   lease_generation: number;
+  /** Exact Attempt retry ordinal for launch-scoped forensic evidence. */
+  work_retry_ordinal: number;
   /**
    * The adapter throttles renewal to this interval while provider work is
    * outstanding. A rejected renewal is an exact-fence loss and must abort

@@ -343,6 +343,8 @@ export interface SettledStructuredPlanningAttempt {
   attempt: KernelAttempt;
   result: Extract<ExecutionRecord, { kind: "result" }>;
   decision: DecisionRecord;
+  /** Exact materialized inputs cited by the settlement DecisionRecord. */
+  decision_input_records: readonly ExecutionRecord[];
   checkpoint: AttemptCheckpoint;
   request_inputs: KernelAttemptRequestInputs;
 }

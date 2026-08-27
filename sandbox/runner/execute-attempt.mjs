@@ -35,10 +35,10 @@ import {
 } from "./agent-runtime.mjs";
 import { createAttemptCheckpoint } from "./checkpoint-bundle.mjs";
 import {
-  INVALID_RESULT_EVIDENCE_SCHEMA,
   stageEvidenceArtifactForTransport,
   stageJsonEvidenceArtifact,
 } from "./evidence-artifact.mjs";
+import { INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA } from "./generated-result-contracts.mjs";
 import { prepareAgentOwnedDirectory } from "./filesystem-isolation.mjs";
 import {
   classifyLaunchFailure,
@@ -301,7 +301,7 @@ function stageInvalidResultEvidence({ request, candidate, execution, artifactDir
   const descriptor = stageJsonEvidenceArtifact({
     directory: artifactDirectory,
     value: {
-      schema: INVALID_RESULT_EVIDENCE_SCHEMA,
+      schema: INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
       pipeline_run_id: request.pipeline_run_id,
       attempt_id: request.attempt_id,
       request_hash: request.request_hash,

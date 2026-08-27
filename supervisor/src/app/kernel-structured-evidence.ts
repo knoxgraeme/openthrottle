@@ -149,7 +149,15 @@ export function assertStructuredRequestContextExact(
 export function assertStructuredSettledEvidence(
   evidence: SettledStructuredPlanningAttempt,
 ): void {
-  const { attempt, result, decision, checkpoint, request_inputs: requestInputs } = evidence;
+  const {
+    attempt,
+    result,
+    decision,
+    decision_input_records: decisionInputs,
+    checkpoint,
+    request_inputs: requestInputs,
+  } = evidence;
+  const decisionInputIds = decisionInputs.map(({ id }) => id).sort(compareCodeUnits);
   if (
     attempt.status !== "settled" || attempt.result_record_id !== result.id ||
     attempt.decision_record_id !== decision.id || attempt.checkpoint_id !== checkpoint.id ||
@@ -165,6 +173,12 @@ export function assertStructuredSettledEvidence(
     checkpoint.input_subject !== attempt.input_subject ||
     checkpoint.output_subject !== attempt.output_subject
   ) throw new Error(`structured settled evidence for ${attempt.id} is not exact`);
+  if (
+    new Set(decisionInputIds).size !== decisionInputIds.length ||
+    canonicalJson(decisionInputIds) !==
+      canonicalJson([...decision.input_record_ids].sort(compareCodeUnits)) ||
+    decisionInputs.some((record) => record.pipeline_run_id !== attempt.pipeline_run_id)
+  ) throw new Error(`structured settled evidence for ${attempt.id} omitted decision inputs`);
   assertStructuredRequestContextExact(attempt, requestInputs);
 }
 
@@ -174,6 +188,7 @@ export function projectCurrentStructuredEvidence(input: {
   decision: DecisionRecord;
   checkpoint: AttemptCheckpoint;
   request_inputs: KernelAttemptRequestInputs;
+  decision_input_records?: readonly ExecutionRecord[];
 }): SettledStructuredPlanningAttempt {
   const projected: SettledStructuredPlanningAttempt = {
     attempt: {
@@ -185,6 +200,8 @@ export function projectCurrentStructuredEvidence(input: {
     },
     result: input.result,
     decision: input.decision,
+    decision_input_records: [...(input.decision_input_records ?? [input.result])]
+      .sort((left, right) => compareCodeUnits(left.id, right.id)),
     checkpoint: input.checkpoint,
     request_inputs: input.request_inputs,
   };

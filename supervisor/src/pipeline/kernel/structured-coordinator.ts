@@ -782,6 +782,7 @@ export function createBlockingReviewRemediationAttempt(input: {
   decision: DecisionRecord;
   checkpoints: readonly AttemptCheckpoint[];
   runtime_delivery_records: readonly ExecutionRecord[];
+  additional_context_records?: readonly ExecutionRecord[];
   bundle: DefinitionBundle;
   manifest: CompiledPipelineManifest;
 }): KernelAttempt {
@@ -797,7 +798,15 @@ export function createBlockingReviewRemediationAttempt(input: {
   if (input.input_subject !== input.attempt.input_subject) {
     throw new Error("remediation input subject must equal the reviewed input subject");
   }
-  assertExactResultIdentity(input);
+  assertExactResultIdentity({
+    ...input,
+    allow_additional_decision_inputs: true,
+  });
+  if ((input.additional_context_records ?? []).some(
+    ({ id }) => !input.decision.input_record_ids.includes(id),
+  )) {
+    throw new Error("review remediation context is not authorized by its DecisionRecord");
+  }
   const payload = decisionPayload(input.decision);
   if (
     payload.evaluator !== "core/review-outcome@1" ||
@@ -861,6 +870,7 @@ export function createBlockingReviewRemediationAttempt(input: {
           pipeline_run_id: input.pipeline_run_id,
           base_records: [input.decision, input.result, ...runtimeDeliveries],
           inherited_records: input.runtime_delivery_records,
+          additional_records: input.additional_context_records,
         }),
         checkpoints,
       },

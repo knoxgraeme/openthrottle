@@ -5,14 +5,17 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   ATTEMPT_CHECKPOINT_SCHEMA,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
   COMPILED_PIPELINE_MANIFEST_SCHEMA,
   EFFECT_INTENT_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
   canonicalJson,
+  digestNormalized,
   expandCompiledRuntimeLifecycle,
   runtimeStopStageId,
   digestCanonicalJson,
   type AttemptCheckpoint,
+  type AttemptForensicsPayload,
   type BlobPointer,
   type CompiledPipelineManifest,
   type DecisionRecord,
@@ -20,6 +23,7 @@ import {
   type EffectIntent,
   type ExecutionRecordPayloadContract,
   type ExecutionRecordPayloadRegistry,
+  type InvalidResultEvidencePayload,
   type JsonValue,
   type ResultRecord,
 } from "@openthrottle/contracts";
@@ -40,6 +44,10 @@ import {
   ordinaryKernelPayloadSchemas,
 } from "../pipeline/kernel/evaluator-registry.js";
 import {
+  createAttemptForensicsRecord,
+  createInvalidResultEvidenceRecord,
+} from "../pipeline/kernel/attempt-evidence.js";
+import {
   KERNEL_ATTEMPT_SCHEMA,
   KERNEL_RUN_SCHEMA,
   type AtomicTransitionBundle,
@@ -51,6 +59,8 @@ import { VolumeBlobStore } from "./blob-store.js";
 import {
   createFreshEpochBootstrap,
   initializeFreshEpochDatabase,
+  openFreshEpochDatabase,
+  type FreshEpochIdentity,
 } from "./epoch-database.js";
 import {
   SqliteKernelStore,
@@ -174,7 +184,9 @@ function setup(
   executionWidth = 1,
 ): {
   db: Database.Database;
+  database_path: string;
   blobs: VolumeBlobStore;
+  expected_identity: FreshEpochIdentity;
   store: SqliteKernelStore;
   admission: PipelineAdmissionInput;
   pipelineManifest: CompiledPipelineManifest;
@@ -197,11 +209,19 @@ function setup(
       runtime_snapshot: OPERATOR_EFFECT_REJECTION_RUNTIME_SNAPSHOT,
     }],
   });
-  const db = initializeFreshEpochDatabase({
-    database_path: join(directory, "epoch.sqlite"),
-    blob_store: blobs,
+  const databasePath = join(directory, "epoch.sqlite");
+  const expectedIdentity: FreshEpochIdentity = {
     release_id: "release-a",
     runtime_capability_digest: "c".repeat(64),
+    blob_store_id: blobs.store_id,
+    blob_marker_checksum: blobs.marker_checksum,
+    bootstrap_checksum: bootstrap.checksum,
+  };
+  const db = initializeFreshEpochDatabase({
+    database_path: databasePath,
+    blob_store: blobs,
+    release_id: expectedIdentity.release_id,
+    runtime_capability_digest: expectedIdentity.runtime_capability_digest,
     bootstrap,
     now,
   });
@@ -235,7 +255,9 @@ function setup(
   });
   return {
     db,
+    database_path: databasePath,
     blobs,
+    expected_identity: expectedIdentity,
     store,
     pipelineManifest,
     admission: {
@@ -275,6 +297,29 @@ function setup(
       definition_bundle: definitionBundle,
       initial_attempts: [initialAttempt],
     },
+  };
+}
+
+function reopenStore(context: ReturnType<typeof setup>): {
+  db: Database.Database;
+  store: SqliteKernelStore;
+} {
+  const blobs = VolumeBlobStore.open(context.blobs.root, context.blobs.store_id);
+  const db = openFreshEpochDatabase({
+    database_path: context.database_path,
+    blob_store: blobs,
+    expected_identity: context.expected_identity,
+  });
+  return {
+    db,
+    store: new SqliteKernelStore({
+      db,
+      blob_store: blobs,
+      manifest_resolver: { resolve: () => context.pipelineManifest },
+      payload_schemas: payloadSchemas,
+      execution_policy: EXECUTION_POLICY,
+      now: () => NOW,
+    }),
   };
 }
 
@@ -695,17 +740,71 @@ async function claimAndStart(setupResult: ReturnType<typeof setup>): Promise<{
   return { attempt: sessionBound.current_attempt!, run: sessionBound.run };
 }
 
-function putInvalidResultEvidence(blobs: VolumeBlobStore): BlobPointer {
+function putInvalidResultEvidence(
+  blobs: VolumeBlobStore,
+  overrides: Partial<InvalidResultEvidencePayload> = {},
+): BlobPointer {
+  const payload: InvalidResultEvidencePayload = {
+    schema: "openthrottle.invalid-result-evidence/v1",
+    pipeline_run_id: "run-1",
+    attempt_id: "attempt-1",
+    request_hash: sha("a"),
+    definition_bundle_hash: digestNormalized('{"bundle":"test"}'),
+    phase: "work",
+    candidate_hash: sha("e"),
+    rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
+    diagnostics: [{ path: "/payload", detail: "invalid" }],
+    runner_stdout_tail: "",
+    runner_stderr_tail: "",
+    observed_at: NOW,
+    ...overrides,
+  };
   return blobs.put({
-    bytes: canonicalJson({
-      schema: "openthrottle.invalid-result-evidence/v1",
-      rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
-      diagnostics: [{ path: "/payload", detail: "invalid" }],
-    }),
+    bytes: canonicalJson(payload),
     encoding: "utf-8",
     media_type: "application/json",
     payload_schema: "openthrottle.invalid-result-evidence/v1",
   }).pointer;
+}
+
+function putAttemptForensics(
+  blobs: VolumeBlobStore,
+  attempt: KernelAttempt,
+  overrides: Partial<AttemptForensicsPayload> = {},
+): {
+  blob: BlobPointer;
+  operational_signature: string;
+  observed_at: string;
+} {
+  if (!attempt.lease?.started) throw new Error("forensics fixture requires a started lease");
+  const payload: AttemptForensicsPayload = {
+    schema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+    pipeline_run_id: attempt.pipeline_run_id,
+    attempt_id: attempt.id,
+    request_hash: attempt.request_hash,
+    definition_bundle_hash: attempt.definition_bundle_hash,
+    lease_id: attempt.lease.id,
+    work_retry_ordinal: attempt.work_retry_ordinal,
+    operational_signature: sha("f"),
+    exit_code: 1,
+    runner_stdout_tail: "",
+    runner_stderr_tail: "silent exit",
+    result_path_state: { state: "missing" },
+    session_event_state: { state: "missing" },
+    workspace_git_status: { state: "present", summary: "", detail: "" },
+    observed_at: NOW,
+    ...overrides,
+  };
+  return {
+    blob: blobs.put({
+      bytes: canonicalJson(payload),
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+    }).pointer,
+    operational_signature: payload.operational_signature,
+    observed_at: payload.observed_at,
+  };
 }
 
 async function prepareResultPendingTransition(
@@ -748,8 +847,14 @@ async function prepareResultPendingTransition(
     record_ids: [],
     checkpoint_ids: [checkpoint.id],
   });
+  const evidence = createInvalidResultEvidenceRecord({
+    attempt: completed.current_attempt!,
+    pointer: invalidResultEvidence,
+    created_at: NOW,
+  });
   return reduceKernelCommand({
     ...completed,
+    records: exactMap(evidence),
     command: {
       type: "result_pending",
       command_id: "result-pending-with-evidence",
@@ -758,6 +863,7 @@ async function prepareResultPendingTransition(
       diagnostics: [{ path: "/payload", detail: "invalid" }],
       correction_deadline: "2026-08-20T12:15:00.000Z",
       invalid_result_evidence: invalidResultEvidence,
+      invalid_result_evidence_record_id: evidence.id,
     },
   });
 }
@@ -815,6 +921,118 @@ describe("SqliteKernelStore", () => {
       for (const table of ["definitions", "work_items", "pipeline_runs", "attempts"]) {
         expect(context.db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get()).toEqual({ count: 0 });
       }
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each([
+    ["pipeline run", { pipeline_run_id: "run-other" }],
+    ["Attempt", { attempt_id: "attempt-other" }],
+    ["request", { request_hash: sha("f") }],
+    ["DefinitionBundle", { definition_bundle_hash: sha("f") }],
+    ["candidate", { candidate_hash: sha("f") }],
+  ] as const)("rejects invalid-result evidence with another %s identity", (_label, overrides) => {
+    const context = setup();
+    try {
+      const invalidResultEvidence = putInvalidResultEvidence(context.blobs, overrides);
+      const initialAttempt = attempt({
+        ...context.admission.initial_attempts[0],
+        status: "result_pending",
+        native_session_id: "session-initial-pending",
+        result_correction_deadline: "2026-08-20T12:15:00.000Z",
+        pending_result: {
+          candidate_hash: sha("e"),
+          diagnostics: [{ path: "/payload", detail: "invalid" }],
+          invalid_result_evidence: invalidResultEvidence,
+        },
+      });
+      const admission = {
+        ...context.admission,
+        initial_attempts: [initialAttempt],
+        run: run([initialAttempt], context.admission.run.definition_bundle_hash),
+      };
+
+      expect(() => context.store.admitPipelineRun(admission))
+        .toThrow(/invalid-result evidence changed its sealed identity/);
+      expect(context.db.prepare("SELECT COUNT(*) AS count FROM pipeline_runs").get())
+        .toEqual({ count: 0 });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("persists retry forensics under the stable pre-retry Attempt identity", async () => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const started = await claimAndStart(context);
+      const evidence = putAttemptForensics(context.blobs, started.attempt);
+      const record = createAttemptForensicsRecord({ attempt: started.attempt, evidence });
+      const transition = reduceKernelCommand({
+        manifest: context.pipelineManifest,
+        run: started.run,
+        current_attempt: started.attempt,
+        records: exactMap(record),
+        checkpoints: new Map(),
+        command: {
+          type: "retry",
+          command_id: "retry-with-forensics",
+          attempt_id: started.attempt.id,
+          forensics_record_id: record.id,
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition)).resolves.toEqual({
+        disposition: "applied",
+        run_version: started.run.version + 1,
+      });
+      await expect(context.store.loadAttemptForensics({
+        pipeline_run_id: started.run.id,
+        attempt_id: started.attempt.id,
+        work_retry_ordinal: 0,
+      })).resolves.toEqual(expect.objectContaining({
+        record,
+        payload: expect.objectContaining({
+          lease_id: started.attempt.lease!.id,
+          work_retry_ordinal: 0,
+          observed_at: NOW,
+        }),
+      }));
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it.each([
+    ["lease", { lease_id: "lease-other" }],
+    ["retry ordinal", { work_retry_ordinal: 1 }],
+    ["request", { request_hash: sha("f") }],
+  ] as const)("rejects retry forensics with another stable %s identity", async (_label, overrides) => {
+    const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const started = await claimAndStart(context);
+      const evidence = putAttemptForensics(context.blobs, started.attempt, overrides);
+      const record = createAttemptForensicsRecord({ attempt: started.attempt, evidence });
+      const transition = reduceKernelCommand({
+        manifest: context.pipelineManifest,
+        run: started.run,
+        current_attempt: started.attempt,
+        records: exactMap(record),
+        checkpoints: new Map(),
+        command: {
+          type: "retry",
+          command_id: `retry-with-invalid-forensics-${_label}`,
+          attempt_id: started.attempt.id,
+          forensics_record_id: record.id,
+        },
+      });
+
+      await expect(context.store.applyAtomicTransition(transition))
+        .rejects.toThrow(/changed its live Attempt forensics identity/);
+      expect(context.db.prepare("SELECT work_retry_ordinal FROM attempts WHERE id = 'attempt-1'").get())
+        .toEqual({ work_retry_ordinal: 0 });
     } finally {
       context.db.close();
     }
@@ -2052,8 +2270,57 @@ describe("SqliteKernelStore", () => {
     },
   );
 
-  it("blocks active Attempt loads when invalid-result evidence becomes corrupt", async () => {
+  it.each([
+    ["encoding", { encoding: "binary" }],
+    ["media type", { media_type: "application/octet-stream" }],
+    ["payload schema", { payload_schema: "openthrottle.attempt-forensics/v1" }],
+  ] as const)("rejects invalid-result evidence with noncanonical pointer %s", async (_label, override) => {
     const context = setup();
+    try {
+      context.store.admitPipelineRun(context.admission);
+      const validPointer = putInvalidResultEvidence(context.blobs);
+      const invalidPointer: BlobPointer = { ...validPointer, ...override };
+      const transition = await prepareResultPendingTransition(context, validPointer);
+      const { content_hash: _contentHash, ...content } = transition;
+      const invalidContent: AtomicTransitionBundleContent = {
+        ...content,
+        attempt_writes: content.attempt_writes.map((write) => write.kind === "terminal"
+          ? write
+          : {
+            ...write,
+            attempt: {
+              ...write.attempt,
+              pending_result: {
+                ...write.attempt.pending_result!,
+                invalid_result_evidence: invalidPointer,
+              },
+            },
+          }),
+      };
+      const invalidTransition: AtomicTransitionBundle = {
+        ...invalidContent,
+        content_hash: digestCanonicalJson(invalidContent),
+      };
+
+      await expect(context.store.applyAtomicTransition(invalidTransition))
+        .rejects.toThrow(/invalid-result evidence pointer is not canonical JSON/);
+      expect(context.db.prepare(`
+        SELECT status, pending_candidate_hash, pending_diagnostics_json
+        FROM attempts WHERE id = 'attempt-1'
+      `).get()).toEqual({
+        status: "work_complete",
+        pending_candidate_hash: null,
+        pending_diagnostics_json: null,
+      });
+    } finally {
+      context.db.close();
+    }
+  });
+
+  it("blocks active Attempt loads after restart when invalid-result evidence becomes corrupt", async () => {
+    const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
     try {
       context.store.admitPipelineRun(context.admission);
       const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
@@ -2063,8 +2330,12 @@ describe("SqliteKernelStore", () => {
         context.blobs.objectPath(invalidResultEvidence.digest),
         Buffer.alloc(invalidResultEvidence.bytes, 0x78),
       );
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
 
-      await expect(context.store.loadExactReductionView({
+      await expect(reopened.store.loadExactReductionView({
         pipeline_run_id: "run-1",
         attempt_id: "attempt-1",
         record_ids: [],
@@ -2083,12 +2354,15 @@ describe("SqliteKernelStore", () => {
         },
       });
     } finally {
-      context.db.close();
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
     }
   });
 
-  it("does not let an immutable Attempt lease replay bypass evidence verification", async () => {
+  it("does not let an immutable Attempt lease replay after restart bypass evidence verification", async () => {
     const context = setup();
+    let originalClosed = false;
+    let reopenedDb: Database.Database | undefined;
     try {
       context.store.admitPipelineRun(context.admission);
       const invalidResultEvidence = putInvalidResultEvidence(context.blobs);
@@ -2107,8 +2381,12 @@ describe("SqliteKernelStore", () => {
         context.blobs.objectPath(invalidResultEvidence.digest),
         Buffer.alloc(invalidResultEvidence.bytes, 0x78),
       );
+      context.db.close();
+      originalClosed = true;
+      const reopened = reopenStore(context);
+      reopenedDb = reopened.db;
 
-      await expect(context.store.leaseNextEligibleAttempt(request)).rejects.toMatchObject({
+      await expect(reopened.store.leaseNextEligibleAttempt(request)).rejects.toMatchObject({
         name: "KernelIntegrityError",
         code: "KERNEL_BLOB_INTEGRITY",
         evidence: {
@@ -2119,7 +2397,8 @@ describe("SqliteKernelStore", () => {
         },
       });
     } finally {
-      context.db.close();
+      reopenedDb?.close();
+      if (!originalClosed) context.db.close();
     }
   });
 
@@ -2146,16 +2425,10 @@ describe("SqliteKernelStore", () => {
         payload: { inline: deliveryPayload },
         created_at: NOW,
       };
-      const invalidEvidence = context.blobs.put({
-        bytes: canonicalJson({
-          schema: "openthrottle.invalid-result-evidence/v1",
-          rejected_candidate: { raw: "{\"outcome\":\"invalid\"}" },
-          diagnostics: [{ path: "/payload", detail: "invalid" }],
-        }),
-        encoding: "utf-8",
-        media_type: "application/json",
-        payload_schema: "openthrottle.invalid-result-evidence/v1",
-      }).pointer;
+      const invalidEvidence = putInvalidResultEvidence(context.blobs, {
+        phase: "result_correction",
+        candidate_hash: sha("5"),
+      });
       context.db.transaction(() => {
         context.db.prepare(`
           INSERT INTO checkpoints (
@@ -2219,17 +2492,11 @@ describe("SqliteKernelStore", () => {
       });
       expect(pending.current_attempt?.pending_result?.invalid_result_evidence)
         .toEqual(invalidEvidence);
-      const evidenceRecord: DecisionRecord = {
-        schema: EXECUTION_RECORD_SCHEMA,
-        id: "decision-invalid-result-evidence",
-        kind: "decision",
-        pipeline_run_id: "run-1",
-        reducer: "core/invalid-result-evidence@1",
-        input_record_ids: [],
-        payload_schema: "openthrottle.invalid-result-evidence/v1",
-        payload: { blob: invalidEvidence },
+      const evidenceRecord = createInvalidResultEvidenceRecord({
+        attempt: pending.current_attempt!,
+        pointer: invalidEvidence,
         created_at: NOW,
-      };
+      });
       const decision: DecisionRecord = {
         schema: EXECUTION_RECORD_SCHEMA,
         id: "decision-result-correction-exhausted",

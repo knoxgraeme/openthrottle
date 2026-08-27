@@ -29,6 +29,11 @@ import {
   sandboxRecoveryAttemptId,
 } from "./sandbox-recovery.js";
 import {
+  ATTEMPT_FORENSICS_REDUCER,
+  assertExactInvalidResultEvidenceRecord,
+  attemptForensicsRecordId,
+} from "./attempt-evidence.js";
+import {
   assertAttemptCommandMapsEmpty,
   assertBaseInput,
   assertExactMap,
@@ -394,8 +399,11 @@ function assertUniqueNewAttempts(
   if (new Set(scopes).size !== scopes.length) throw new Error("new sibling attempt scopes must be unique");
 }
 
-function recordForAttempt(input: ReducerInput, attempt: KernelAttempt, recordId: string): ResultRecord {
-  assertExactMap(input.records, [recordId], "record map");
+function resultForAttempt(
+  input: ReducerInput,
+  attempt: KernelAttempt,
+  recordId: string,
+): ResultRecord {
   const candidate = input.records.get(recordId);
   if (!candidate || candidate.kind !== "result") throw new Error(`record ${recordId} is not a ResultRecord`);
   if (
@@ -408,6 +416,34 @@ function recordForAttempt(input: ReducerInput, attempt: KernelAttempt, recordId:
     throw new Error(`ResultRecord ${recordId} does not match the complete attempt identity`);
   }
   return candidate;
+}
+
+function recordForAttempt(input: ReducerInput, attempt: KernelAttempt, recordId: string): ResultRecord {
+  assertExactMap(input.records, [recordId], "record map");
+  return resultForAttempt(input, attempt, recordId);
+}
+
+function assertRecordableResult(
+  input: ReducerInput,
+  attempt: KernelAttempt,
+  result: ResultRecord,
+): void {
+  const stage = stageFor(input.manifest, attempt.scope.stage_id);
+  if (attempt.result_record_id !== null && attempt.result_record_id !== result.id) {
+    throw new Error(`attempt ${attempt.id} already persists another authoritative result`);
+  }
+  if (attempt.repository_authority === "edit" && result.output_subject === null) {
+    throw new Error("edit ResultRecord must retain its verified output subject");
+  }
+  if (
+    attempt.repository_authority === "inspect" && stage.kind !== "effect" &&
+    result.output_subject !== null
+  ) {
+    throw new Error("inspect ResultRecord cannot advance the repository subject");
+  }
+  if (stage.kind === "wait" && result.output_subject !== null) {
+    throw new Error("wait ResultRecord cannot advance the repository subject");
+  }
 }
 
 function terminalAttemptWrites(
@@ -1037,7 +1073,7 @@ function normalizedDiagnostics(diagnostics: readonly ResultDiagnostic[]): Result
 function resultPending(input: ReducerInput): AtomicTransitionBundle {
   const command = input.command;
   if (command.type !== "result_pending") throw new Error("unreachable result_pending command");
-  assertExactMap(input.records, [], "record map");
+  assertExactMap(input.records, [command.invalid_result_evidence_record_id], "record map");
   const attempt = currentAttempt(input, command.attempt_id);
   const retryingCorrection = attempt.status === "result_pending" &&
     attempt.lease?.purpose === "result_correction" && attempt.lease.started;
@@ -1069,6 +1105,15 @@ function resultPending(input: ReducerInput): AtomicTransitionBundle {
   ) {
     throw new Error("result_pending cannot change its correction deadline");
   }
+  const evidence = input.records.get(command.invalid_result_evidence_record_id);
+  if (!evidence || evidence.kind !== "decision") {
+    throw new Error("result_pending requires its exact invalid-result evidence record");
+  }
+  assertExactInvalidResultEvidenceRecord({
+    attempt,
+    pointer: command.invalid_result_evidence,
+    record: evidence,
+  });
   const next: KernelAttempt = {
     ...attempt,
     status: "result_pending",
@@ -1086,6 +1131,7 @@ function resultPending(input: ReducerInput): AtomicTransitionBundle {
     expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
     run: replaceAttempt(input.run, next),
     attemptWrites: [{ kind: "replace", attempt: next }],
+    appendRecords: [evidence],
   }));
 }
 
@@ -1101,21 +1147,7 @@ function record(input: ReducerInput): AtomicTransitionBundle {
   const checkpoint = exactCheckpoint(input, attempt.checkpoint_id);
   assertCheckpointIdentity(checkpoint, attempt, stage);
   const result = recordForAttempt(input, attempt, command.record_id);
-  if (attempt.result_record_id !== null && attempt.result_record_id !== result.id) {
-    throw new Error(`attempt ${attempt.id} already persists another authoritative result`);
-  }
-  if (attempt.repository_authority === "edit" && result.output_subject === null) {
-    throw new Error("edit ResultRecord must retain its verified output subject");
-  }
-  if (
-    attempt.repository_authority === "inspect" && stage.kind !== "effect" &&
-    result.output_subject !== null
-  ) {
-    throw new Error("inspect ResultRecord cannot advance the repository subject");
-  }
-  if (stage.kind === "wait" && result.output_subject !== null) {
-    throw new Error("wait ResultRecord cannot advance the repository subject");
-  }
+  assertRecordableResult(input, attempt, result);
   const next: KernelAttempt = {
     ...attempt,
     status: "recorded",
@@ -1169,15 +1201,17 @@ function effectiveTransition(input: {
   };
 }
 
-function settle(input: ReducerInput): AtomicTransitionBundle {
-  const command = input.command;
-  if (command.type !== "settle") throw new Error("unreachable settle command");
-  const attempt = currentAttempt(input, command.attempt_id);
-  if (attempt.status !== "recorded" || !attempt.result_record_id) {
-    throw new Error(`attempt ${attempt.id} cannot settle before its ResultRecord`);
-  }
-  const authorization = exactDecision(input, command.decision_record_id);
-  if (!authorization.decision.input_record_ids.includes(attempt.result_record_id)) {
+type SettlementCommand = Extract<KernelCommand, { type: "settle" | "correct_and_settle" }>;
+
+function settleAuthorized(
+  input: ReducerInput,
+  command: SettlementCommand,
+  attempt: KernelAttempt,
+  resultRecordId: string,
+  authorization: DecisionAuthorization,
+  appendRecords: readonly ExecutionRecord[],
+): AtomicTransitionBundle {
+  if (!authorization.decision.input_record_ids.includes(resultRecordId)) {
     throw new Error("settlement DecisionRecord must cite the current ResultRecord");
   }
   const stage = stageFor(input.manifest, attempt.scope.stage_id);
@@ -1200,7 +1234,10 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
     status: "settled",
     version: attempt.version + 1,
     lease: null,
+    result_record_id: resultRecordId,
     decision_record_id: authorization.decision.id,
+    result_correction_deadline: null,
+    pending_result: null,
   };
   const remainingAttempts = { ...input.run.active_attempt_versions };
   delete remainingAttempts[attempt.id];
@@ -1229,7 +1266,7 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
       expected: expectedFor(input.run, { [attempt.id]: attempt.version }),
       run: nextRun,
       attemptWrites: [{ kind: "replace", attempt: settledAttempt }],
-      appendRecords: [authorization.decision],
+      appendRecords,
     }));
   }
 
@@ -1291,7 +1328,7 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
     }
     if (isCleanupTerminal) {
       const cited = authorization.exact_records.filter(
-        (record) => record.id !== authorization.decision.id && record.id !== attempt.result_record_id,
+        (record) => record.id !== authorization.decision.id && record.id !== resultRecordId,
       );
       const cleanupDelivery = cited.find((record) => {
         if (record.kind !== "delivery" || !("inline" in record.payload)) return false;
@@ -1305,7 +1342,7 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
       }
     } else {
       const cited = authorization.exact_records.filter(
-        (record) => record.id !== authorization.decision.id && record.id !== attempt.result_record_id,
+        (record) => record.id !== authorization.decision.id && record.id !== resultRecordId,
       );
       if (exactKernelRuntimeAbsenceDelivery(cited) === null) {
         throw new Error("no-resource terminal transition requires exact rejected-create absence proof");
@@ -1397,9 +1434,69 @@ function settle(input: ReducerInput): AtomicTransitionBundle {
     run: nextRun,
     attemptWrites: [{ kind: "replace", attempt: settledAttempt }],
     createAttempts: command.next_attempts,
-    appendRecords: [authorization.decision],
+    appendRecords,
     putEffects: effects,
   }));
+}
+
+function settle(input: ReducerInput): AtomicTransitionBundle {
+  const command = input.command;
+  if (command.type !== "settle") throw new Error("unreachable settle command");
+  const attempt = currentAttempt(input, command.attempt_id);
+  if (attempt.status !== "recorded" || !attempt.result_record_id) {
+    throw new Error(`attempt ${attempt.id} cannot settle before its ResultRecord`);
+  }
+  const authorization = exactDecision(input, command.decision_record_id);
+  return settleAuthorized(
+    input,
+    command,
+    attempt,
+    attempt.result_record_id,
+    authorization,
+    [authorization.decision],
+  );
+}
+
+function correctAndSettle(input: ReducerInput): AtomicTransitionBundle {
+  const command = input.command;
+  if (command.type !== "correct_and_settle") {
+    throw new Error("unreachable correct_and_settle command");
+  }
+  const attempt = currentAttempt(input, command.attempt_id);
+  if (
+    attempt.status !== "result_pending" || attempt.result_record_id !== null ||
+    attempt.lease?.purpose !== "result_correction" || !attempt.lease.started
+  ) {
+    throw new Error(`attempt ${attempt.id} cannot atomically settle a corrected result`);
+  }
+  const pointer = attempt.pending_result?.invalid_result_evidence;
+  if (pointer === null || pointer === undefined) {
+    throw new Error(`attempt ${attempt.id} has no pending invalid-result evidence`);
+  }
+  const decision = input.records.get(command.decision_record_id);
+  if (
+    !decision || decision.kind !== "decision" ||
+    !decision.input_record_ids.includes(command.result_record_id) ||
+    !decision.input_record_ids.includes(command.invalid_result_evidence_record_id)
+  ) {
+    throw new Error("corrected-result settlement must cite its result and invalid evidence");
+  }
+  const authorization = exactDecision(input, command.decision_record_id);
+  const result = resultForAttempt(input, attempt, command.result_record_id);
+  assertRecordableResult(input, attempt, result);
+  const evidence = input.records.get(command.invalid_result_evidence_record_id);
+  if (!evidence || evidence.kind !== "decision") {
+    throw new Error("corrected-result invalid evidence does not match the pending pointer");
+  }
+  assertExactInvalidResultEvidenceRecord({ attempt, pointer, record: evidence });
+  return settleAuthorized(
+    input,
+    command,
+    attempt,
+    result.id,
+    authorization,
+    [result, authorization.decision],
+  );
 }
 
 function retry(input: ReducerInput): AtomicTransitionBundle {
@@ -1430,10 +1527,11 @@ function retry(input: ReducerInput): AtomicTransitionBundle {
     ? null
     : input.records.get(command.forensics_record_id);
   if (forensics !== null && (
-    !forensics || forensics.kind !== "decision" || forensics.reducer !== "core/attempt-forensics@1" ||
+    !forensics || forensics.kind !== "decision" || forensics.reducer !== ATTEMPT_FORENSICS_REDUCER ||
     forensics.pipeline_run_id !== attempt.pipeline_run_id ||
     forensics.payload_schema !== "openthrottle.attempt-forensics/v1" ||
-    forensics.input_record_ids.length !== 0
+    forensics.input_record_ids.length !== 0 || !("blob" in forensics.payload) ||
+    forensics.id !== attemptForensicsRecordId(attempt, attempt.work_retry_ordinal)
   )) throw new Error("retry forensics record is invalid");
   return bundle(baseContent({
     command,
@@ -1463,6 +1561,8 @@ export function reduceKernelCommand(input: ReducerInput): AtomicTransitionBundle
       return record(input);
     case "settle":
       return settle(input);
+    case "correct_and_settle":
+      return correctAndSettle(input);
     case "retry":
       return retry(input);
     case "quarantine_attempt_recovery": {

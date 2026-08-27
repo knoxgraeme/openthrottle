@@ -21,6 +21,7 @@ import {
 
 const supervisorRoot = fileURLToPath(new URL("..", import.meta.url));
 const repoRoot = realpathSync(join(supervisorRoot, ".."));
+const temporaryRoot = realpathSync(tmpdir());
 const cliPath = join(supervisorRoot, "scripts/accept-release.mjs");
 const directories = [];
 
@@ -95,8 +96,8 @@ describe("accept-release process boundary", () => {
 
   it("prints the packaged candidate identity without opening storage", () => {
     const value = {
-      databasePath: join(tmpdir(), "missing-accept-release.sqlite"),
-      blobPath: join(tmpdir(), "missing-accept-release-blobs"),
+      databasePath: join(temporaryRoot, "missing-accept-release.sqlite"),
+      blobPath: join(temporaryRoot, "missing-accept-release-blobs"),
     };
     const result = run(value, { OT_EPOCH_RELEASE_ID: `sha256:${"a".repeat(64)}` }, [
       "--print-identity",

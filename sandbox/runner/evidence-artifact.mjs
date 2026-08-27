@@ -12,15 +12,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
-import { canonicalJson } from "./generated-result-contracts.mjs";
-
-export const EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA =
-  "openthrottle.evidence-artifact-descriptor/v1";
-export const ATTEMPT_FORENSICS_SCHEMA = "openthrottle.attempt-forensics/v1";
-export const INVALID_RESULT_EVIDENCE_SCHEMA =
-  "openthrottle.invalid-result-evidence/v1";
-
-const MAX_EVIDENCE_BYTES = 1024 * 1024;
+import {
+  EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
+  EVIDENCE_ARTIFACT_MAX_BYTES,
+  canonicalJson,
+  validateAttemptEvidencePayload,
+  validateEvidenceArtifactDescriptor,
+} from "./generated-result-contracts.mjs";
 
 function syncDirectory(path) {
   const descriptor = openSync(path, constants.O_RDONLY);
@@ -45,8 +43,12 @@ function immutableBytes(path, bytes, label, mode = 0o400) {
 }
 
 export function stageJsonEvidenceArtifact({ value, directory, descriptorPath = null }) {
-  const bytes = Buffer.from(`${canonicalJson(value)}\n`, "utf8");
-  if (bytes.byteLength < 1 || bytes.byteLength > MAX_EVIDENCE_BYTES) {
+  const validated = validateAttemptEvidencePayload(value, {
+    source: "evidence_artifact.payload",
+  });
+  const payload = validated.value;
+  const bytes = Buffer.from(`${validated.normalized}\n`, "utf8");
+  if (bytes.byteLength < 1 || bytes.byteLength > EVIDENCE_ARTIFACT_MAX_BYTES) {
     throw new Error("evidence artifact exceeds its byte bound");
   }
   const sha256 = createHash("sha256").update(bytes).digest("hex");
@@ -54,14 +56,14 @@ export function stageJsonEvidenceArtifact({ value, directory, descriptorPath = n
   const root = resolve(directory);
   const artifactPath = join(root, file);
   immutableBytes(artifactPath, bytes, "evidence artifact");
-  const descriptor = {
+  const descriptor = validateEvidenceArtifactDescriptor({
     schema: EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
     file,
     sha256,
     bytes: bytes.byteLength,
     media_type: "application/json",
-    payload_schema: value.schema,
-  };
+    payload_schema: payload.schema,
+  }, { source: "evidence_artifact.descriptor", payloadSchema: payload.schema }).value;
   if (descriptorPath !== null) {
     const exactDescriptorPath = resolve(descriptorPath);
     if (dirname(exactDescriptorPath) !== root || basename(exactDescriptorPath) !== "forensics.json") {
@@ -77,13 +79,16 @@ export function stageJsonEvidenceArtifact({ value, directory, descriptorPath = n
 }
 
 export function stageEvidenceArtifactForTransport(descriptor, sourceDirectory, resultPath) {
+  const validated = validateEvidenceArtifactDescriptor(descriptor, {
+    source: "evidence_artifact.descriptor",
+  }).value;
   const targetDirectory = dirname(resultPath);
   mkdirSync(targetDirectory, { recursive: true, mode: 0o700 });
-  const source = join(sourceDirectory, descriptor.file);
-  const target = join(targetDirectory, descriptor.file);
+  const source = join(sourceDirectory, validated.file);
+  const target = join(targetDirectory, validated.file);
   if (resolve(source) !== resolve(target)) {
     if (!existsSync(target)) copyFileSync(source, target, constants.COPYFILE_EXCL);
-    if (statSync(target).size !== descriptor.bytes) {
+    if (statSync(target).size !== validated.bytes) {
       throw new Error("transport evidence artifact size mismatch");
     }
   }

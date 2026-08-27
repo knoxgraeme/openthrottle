@@ -1,5 +1,9 @@
 import {
+  ATTEMPT_FORENSICS_PAYLOAD_CONTRACT,
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
   EXECUTION_RECORD_SCHEMA,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   REVIEW_FINDING_SEVERITIES,
   canonicalJson,
   compareCodeUnits,
@@ -21,14 +25,6 @@ import type {
   StagedSemanticCandidate,
 } from "../../runtime/kernel-contracts.js";
 import type { KernelAttempt } from "./types.js";
-import {
-  ATTEMPT_FORENSICS_PAYLOAD_CONTRACT,
-  INVALID_RESULT_EVIDENCE_PAYLOAD_CONTRACT,
-} from "./attempt-evidence.js";
-import {
-  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
-  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
-} from "../../runtime/kernel-contracts.js";
 
 export const SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA =
   "openthrottle.semantic-result-record/v1" as const;

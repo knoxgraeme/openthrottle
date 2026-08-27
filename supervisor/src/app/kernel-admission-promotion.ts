@@ -232,10 +232,11 @@ export class KernelAdmissionSettlementPlanner implements OrdinaryKernelSettlemen
       throw new Error("admission review must bind exactly one executable planner ResultRecord");
     }
     const planner = planners[0]!;
+    const additionalInputs = input.additional_input_records ?? [];
     const decision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: reviewer,
-      additional_input_records: [planner.record],
+      additional_input_records: [planner.record, ...additionalInputs],
       evaluated: input.evaluated,
       created_at: this.#now(),
     });
@@ -258,12 +259,12 @@ export class KernelAdmissionSettlementPlanner implements OrdinaryKernelSettlemen
       target_scope: { kind: "stage", stage_id: target.id },
       request_inputs: request,
       checkpoint_override: [],
-      additional_context_records: [planner.record],
+      additional_context_records: [planner.record, ...additionalInputs],
     });
     return {
       decision,
       outcome: input.evaluated.outcome,
-      input_records: [planner.record, reviewer]
+      input_records: [planner.record, reviewer, ...additionalInputs]
         .sort((left, right) => compareCodeUnits(left.id, right.id)),
       checkpoints: [],
       next_attempts: [successor],

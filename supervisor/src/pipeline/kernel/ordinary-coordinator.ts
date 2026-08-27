@@ -8,6 +8,7 @@ import {
   runtimeStopStageId,
   validateEvalDefinition,
   type AttemptCheckpoint,
+  type AttemptForensicsPayload,
   type CompiledPipelineStage,
   type DecisionRecord,
   type DefinitionBundle,
@@ -16,6 +17,7 @@ import {
   type PipelineTerminalOutcome,
 } from "@openthrottle/contracts";
 import type {
+  KernelAttemptForensicsEvidence,
   KernelRuntimeOutcome,
   KernelRuntimeLeaseCallbacks,
   KernelRuntimePort,
@@ -65,15 +67,18 @@ import {
 import { exactKernelRuntimeCleanupDeliveries } from "./runtime-resource.js";
 import {
   isSandboxFatalEnospc,
+  exactSandboxRecoveryRecord,
   sandboxFailureReason,
+  sandboxRecoveryAttemptId,
   sandboxRecoveryFrontierEvaluator,
   sandboxRecoveryFrontierReason,
   sandboxRecoveryEvaluator,
 } from "./sandbox-recovery.js";
 import {
+  assertExactInvalidResultEvidenceRecord,
   createAttemptForensicsRecord,
   createInvalidResultEvidenceRecord,
-  type AttemptForensicsPayload,
+  invalidResultEvidenceRecordId,
 } from "./attempt-evidence.js";
 import { stageFor } from "./reducer-support.js";
 
@@ -110,6 +115,7 @@ export interface OrdinaryKernelSettlementPlanner {
     checkpoint: AttemptCheckpoint;
     bundle: DefinitionBundle;
     evaluated: EvaluatedKernelResult;
+    additional_input_records?: readonly ExecutionRecord[];
     default_plan: () => Promise<OrdinaryKernelSettlementPlan>;
   }): Promise<OrdinaryKernelSettlementPlan>;
 }
@@ -297,6 +303,9 @@ export class OrdinaryKernelCoordinator {
     try {
       const view = await this.#load(leased.run_id, leased.attempt.id);
       assertAttemptLeaseClaim(view, claim);
+      if (claim.purpose === "result_correction") {
+        return await this.#terminalCorrectionNeedsHuman(view, reason, claim);
+      }
       if (isSandboxFatalEnospc(error)) {
         return await this.#recoverSandboxFatal(view, sandboxFailureReason(error), claim);
       }
@@ -462,9 +471,8 @@ export class OrdinaryKernelCoordinator {
       attempt.result_correction_deadline === null ||
       attempt.result_correction_deadline <= this.#now()
     )) {
-      return this.#terminal(
+      return this.#terminalCorrectionNeedsHuman(
         view,
-        "needs_human",
         "result_correction_unavailable_or_exhausted",
         claim,
       );
@@ -557,6 +565,7 @@ export class OrdinaryKernelCoordinator {
     if (!lease?.started) throw new Error("ordinary execution lost its started lease");
     return {
       lease_generation: lease.generation,
+      work_retry_ordinal: attempt.work_retry_ordinal,
       heartbeat_interval_ms: Math.max(1, Math.floor(this.#attemptLeaseDurationMs / 3)),
       on_heartbeat: async () => {
         const now = Date.parse(this.#now());
@@ -589,26 +598,28 @@ export class OrdinaryKernelCoordinator {
     assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
     if (input.outcome.state === "work_failed") {
-      if (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason)) {
-        return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
-      }
+      const sandboxFatal = input.outcome.sandbox_fatal ||
+        isSandboxFatalEnospc(input.outcome.reason);
       const forensicsEvidence = input.outcome.forensics ?? null;
       const forensics = forensicsEvidence === null
         ? null
         : createAttemptForensicsRecord({
           attempt,
           evidence: forensicsEvidence,
-          created_at: this.#now(),
         });
       const priorForensics = forensics === null || attempt.work_retry_ordinal === 0
         ? null
-        : await this.#store.loadAttemptForensics({
-          pipeline_run_id: attempt.pipeline_run_id,
-          attempt_id: attempt.id,
-          work_retry_ordinal: attempt.work_retry_ordinal - 1,
-        });
+        : await this.#loadPriorAttemptForensics(attempt);
       const repeatedOperationalFailure = forensicsEvidence !== null && priorForensics !== null &&
         priorForensics.payload.operational_signature === forensicsEvidence.operational_signature;
+      if (sandboxFatal && !repeatedOperationalFailure) {
+        return this.#recoverSandboxFatal(
+          input.view,
+          input.outcome.reason,
+          input.claim,
+          input.outcome.forensics,
+        );
+      }
       if (
         input.outcome.retryable &&
         attempt.work_retry_ordinal < input.view.run.work_retry_limit &&
@@ -683,24 +694,32 @@ export class OrdinaryKernelCoordinator {
       if (completed.current_attempt?.status !== "work_complete") {
         throw new Error("result_pending did not preserve completed work");
       }
-      await this.#apply(
-        await this.#load(
+      const evidence = createInvalidResultEvidenceRecord({
+        attempt: completed.current_attempt,
+        pointer: input.outcome.invalid_result_evidence.blob,
+        created_at: input.outcome.invalid_result_evidence.observed_at,
+      });
+      const pendingView = await this.#load(
           completed.run.id,
           attempt.id,
           [],
           [input.outcome.checkpoint.id],
-        ),
+        );
+      await this.#apply(
+        { ...pendingView, records: mapWith(pendingView.records, evidence) },
         {
           type: "result_pending",
           command_id: transitionId("result-pending", {
             attempt: attempt.id,
             candidate: input.outcome.candidate_hash,
+            evidence: evidence.id,
           }),
           attempt_id: attempt.id,
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
           correction_deadline: input.outcome.correction_deadline,
-          invalid_result_evidence: input.outcome.invalid_result_evidence,
+          invalid_result_evidence: input.outcome.invalid_result_evidence.blob,
+          invalid_result_evidence_record_id: evidence.id,
         },
       );
       completed = await this.#load(completed.run.id, attempt.id);
@@ -718,12 +737,28 @@ export class OrdinaryKernelCoordinator {
     view: ReductionView,
     failureReason: string,
     claim: AttemptLeaseClaim,
+    forensicsEvidence?: KernelAttemptForensicsEvidence,
   ): Promise<OrdinaryKernelStep> {
     assertAttemptLeaseClaim(view, claim);
     const attempt = view.current_attempt!;
     const reason = `sandbox_fatal_enospc: ${failureReason}`.slice(0, 1_500);
+    const pendingEvidence = attempt.pending_result?.invalid_result_evidence;
+    const invalidResultEvidence = pendingEvidence === null || pendingEvidence === undefined
+      ? null
+      : await this.#loadInvalidResultEvidenceRecord(attempt, pendingEvidence);
+    const forensics = forensicsEvidence === undefined
+      ? null
+      : createAttemptForensicsRecord({ attempt, evidence: forensicsEvidence });
+    const diagnosticRecords = [
+      ...(invalidResultEvidence === null ? [] : [invalidResultEvidence]),
+      ...(forensics === null ? [] : [forensics]),
+    ];
+    const newDiagnosticIds = forensics === null ? [] : [forensics.id];
     if (attempt.work_retry_ordinal >= view.run.work_retry_limit) {
-      return this.#terminal(view, "failed", reason, claim);
+      return this.#terminal(view, "failed", reason, claim, {
+        records: diagnosticRecords,
+        new_record_ids: newDiagnosticIds,
+      });
     }
     const requestInputs = await this.#store.loadAttemptRequestInputs({
       pipeline_run_id: view.run.id,
@@ -732,7 +767,12 @@ export class OrdinaryKernelCoordinator {
     const runtimeDeliveries = exactKernelRuntimeCleanupDeliveries(
       [...requestInputs.context.records.values()],
     );
-    if (runtimeDeliveries === null) return this.#terminal(view, "failed", reason, claim);
+    if (runtimeDeliveries === null) {
+      return this.#terminal(view, "failed", reason, claim, {
+        records: diagnosticRecords,
+        new_record_ids: newDiagnosticIds,
+      });
+    }
     const recoveryFrontier = await Promise.all(view.run.cursor.frontier
       .filter(({ attempt_id }) => view.run.active_attempt_versions[attempt_id] !== undefined)
       .map(async (member) => {
@@ -757,7 +797,11 @@ export class OrdinaryKernelCoordinator {
     const decision = createPipelineDecisionRecord({
       attempt,
       result: null,
-      additional_input_records: [...runtimeDeliveries, ...recoveryFrontier],
+      additional_input_records: [
+        ...runtimeDeliveries,
+        ...recoveryFrontier,
+        ...diagnosticRecords,
+      ],
       evaluated: {
         evaluator: sandboxRecoveryEvaluator(attempt.id),
         outcome: "retryable_infrastructure_failure",
@@ -778,15 +822,21 @@ export class OrdinaryKernelCoordinator {
       task_prompt: requestInputs.task_prompt,
       runtime_delivery_records: runtimeDeliveries,
       recovery_frontier_records: recoveryFrontier,
+      diagnostic_records: diagnosticRecords,
     });
     const exact = await this.#load(
       view.run.id,
       attempt.id,
-      runtimeDeliveries.map(({ id }) => id),
+      [
+        ...runtimeDeliveries.map(({ id }) => id),
+        ...diagnosticRecords
+          .filter(({ id }) => !newDiagnosticIds.includes(id))
+          .map(({ id }) => id),
+      ],
     );
     await this.#apply({
       ...exact,
-      records: mapWith(exact.records, ...recoveryFrontier, decision),
+      records: mapWith(exact.records, ...recoveryFrontier, ...(forensics === null ? [] : [forensics]), decision),
       checkpoints: new Map(),
     }, {
       type: "fail",
@@ -800,8 +850,8 @@ export class OrdinaryKernelCoordinator {
       resource_disposition: {
         kind: "cleanup",
         runtime_delivery_record_ids: runtimeDeliveries.map(({ id }) => id).sort(),
-        diagnostic_record_ids: [],
-        new_diagnostic_record_ids: [],
+        diagnostic_record_ids: diagnosticRecords.map(({ id }) => id).sort(compareCodeUnits),
+        new_diagnostic_record_ids: [...newDiagnosticIds].sort(compareCodeUnits),
         cleanup_attempt: cleanupAttempt,
       },
     }, claim);
@@ -822,20 +872,31 @@ export class OrdinaryKernelCoordinator {
   }): Promise<OrdinaryKernelStep> {
     assertAttemptLeaseClaim(input.view, input.claim);
     const attempt = input.view.current_attempt!;
-    if (
-      input.outcome.state === "work_failed" &&
-      (input.outcome.sandbox_fatal || isSandboxFatalEnospc(input.outcome.reason))
-    ) {
-      return this.#recoverSandboxFatal(input.view, input.outcome.reason, input.claim);
-    }
     if (input.outcome.state === "work_complete") {
       if (!sameCheckpoint(input.checkpoint, input.outcome.checkpoint)) {
         throw new Error("result correction changed the locked work checkpoint");
       }
-      return this.#recordEvaluateAndSettle({
+      const completed = this.#createResultRecord({
         view: input.view,
         bundle: input.bundle,
         result: input.outcome.result,
+      });
+      const pendingEvidence = attempt.pending_result?.invalid_result_evidence;
+      if (pendingEvidence === null || pendingEvidence === undefined) {
+        return this.#recordAndSettle({
+          view: input.view,
+          bundle: input.bundle,
+          ...completed,
+          claim: input.claim,
+        });
+      }
+      const evidence = await this.#loadInvalidResultEvidenceRecord(attempt, pendingEvidence);
+      return this.#correctAndSettle({
+        view: input.view,
+        bundle: input.bundle,
+        checkpoint: input.checkpoint,
+        evidence,
+        ...completed,
         claim: input.claim,
       });
     }
@@ -843,12 +904,12 @@ export class OrdinaryKernelCoordinator {
       if (!sameCheckpoint(input.checkpoint, input.outcome.checkpoint)) {
         throw new Error("result correction changed the locked work checkpoint");
       }
+      const evidence = createInvalidResultEvidenceRecord({
+        attempt,
+        pointer: input.outcome.invalid_result_evidence.blob,
+        created_at: input.outcome.invalid_result_evidence.observed_at,
+      });
       if (attempt.result_correction_count >= input.view.run.result_correction_limit) {
-        const evidence = createInvalidResultEvidenceRecord({
-          attempt,
-          pointer: input.outcome.invalid_result_evidence,
-          created_at: this.#now(),
-        });
         return this.#terminal(
           input.view,
           "needs_human",
@@ -857,20 +918,28 @@ export class OrdinaryKernelCoordinator {
           { records: [evidence], new_record_ids: [evidence.id] },
         );
       }
+      const pendingView = await this.#load(
+        input.view.run.id,
+        attempt.id,
+        [],
+        [input.checkpoint.id],
+      );
       await this.#apply(
-        await this.#load(input.view.run.id, attempt.id, [], [input.checkpoint.id]),
+        { ...pendingView, records: mapWith(pendingView.records, evidence) },
         {
           type: "result_pending",
           command_id: transitionId("result-pending", {
             attempt: attempt.id,
             candidate: input.outcome.candidate_hash,
             correction: attempt.result_correction_count,
+            evidence: evidence.id,
           }),
           attempt_id: attempt.id,
           candidate_hash: input.outcome.candidate_hash,
           diagnostics: input.outcome.diagnostics,
           correction_deadline: input.outcome.correction_deadline,
-          invalid_result_evidence: input.outcome.invalid_result_evidence,
+          invalid_result_evidence: input.outcome.invalid_result_evidence.blob,
+          invalid_result_evidence_record_id: evidence.id,
         },
         input.claim,
       );
@@ -881,17 +950,82 @@ export class OrdinaryKernelCoordinator {
       : input.outcome.state === "work_failed"
         ? input.outcome.reason
         : "result_correction_did_not_produce_a_semantic_candidate";
+    const forensicsEvidence = input.outcome.state === "work_failed"
+      ? input.outcome.forensics ?? null
+      : null;
+    return this.#terminalCorrectionNeedsHuman(
+      input.view,
+      reason,
+      input.claim,
+      forensicsEvidence,
+    );
+  }
+
+  async #loadPriorAttemptForensics(
+    attempt: KernelAttempt,
+  ): Promise<{ record: DecisionRecord; payload: AttemptForensicsPayload } | null> {
+    if (attempt.work_retry_ordinal === 0) return null;
+    const priorOrdinal = attempt.work_retry_ordinal - 1;
+    const requestInputs = await this.#store.loadAttemptRequestInputs({
+      pipeline_run_id: attempt.pipeline_run_id,
+      attempt_id: attempt.id,
+    });
+    const recovery = exactSandboxRecoveryRecord([...requestInputs.context.records.values()]);
+    let sourceAttemptId = attempt.id;
+    let requireRecoveryCitation = false;
+    if (recovery !== null) {
+      const predecessorId = sandboxRecoveryAttemptId(recovery)!;
+      const predecessor = (await this.#load(attempt.pipeline_run_id, predecessorId)).current_attempt;
+      if (
+        predecessor !== null && predecessor.status === "failed" &&
+        predecessor.definition_bundle_hash === attempt.definition_bundle_hash &&
+        predecessor.input_subject === attempt.input_subject &&
+        predecessor.repository_authority === attempt.repository_authority &&
+        canonicalJson(predecessor.scope) === canonicalJson(attempt.scope) &&
+        attempt.work_retry_ordinal === predecessor.work_retry_ordinal + 1
+      ) {
+        sourceAttemptId = predecessor.id;
+        requireRecoveryCitation = true;
+      }
+    }
+    const prior = await this.#store.loadAttemptForensics({
+      pipeline_run_id: attempt.pipeline_run_id,
+      attempt_id: sourceAttemptId,
+      work_retry_ordinal: priorOrdinal,
+    });
+    if (
+      prior !== null && requireRecoveryCitation &&
+      !recovery!.input_record_ids.includes(prior.record.id)
+    ) return null;
+    return prior;
+  }
+
+  async #terminalCorrectionNeedsHuman(
+    view: ReductionView,
+    reason: string,
+    claim: AttemptLeaseClaim,
+    forensicsEvidence?: KernelAttemptForensicsEvidence | null,
+  ): Promise<OrdinaryKernelStep> {
+    assertAttemptLeaseClaim(view, claim);
+    const attempt = view.current_attempt!;
     const pendingEvidence = attempt.pending_result?.invalid_result_evidence;
     const evidence = pendingEvidence === null || pendingEvidence === undefined
       ? null
-      : createInvalidResultEvidenceRecord({
-        attempt,
-        pointer: pendingEvidence,
-        created_at: this.#now(),
-      });
-    return this.#terminal(input.view, "needs_human", reason, input.claim, evidence === null
-      ? undefined
-      : { records: [evidence], new_record_ids: [evidence.id] });
+      : await this.#loadInvalidResultEvidenceRecord(attempt, pendingEvidence);
+    const forensics = forensicsEvidence === null || forensicsEvidence === undefined
+      ? null
+      : createAttemptForensicsRecord({ attempt, evidence: forensicsEvidence });
+    const diagnosticRecords = [
+      ...(evidence === null ? [] : [evidence]),
+      ...(forensics === null ? [] : [forensics]),
+    ];
+    return this.#terminal(view, "needs_human", reason, claim,
+      diagnosticRecords.length === 0
+        ? undefined
+        : {
+          records: diagnosticRecords,
+          new_record_ids: forensics === null ? [] : [forensics.id],
+        });
   }
 
   async #completeWork(
@@ -917,20 +1051,6 @@ export class OrdinaryKernelCoordinator {
       verified_output_subject: checkpoint.output_subject,
       result_record_id: record?.id ?? null,
     }, claim);
-  }
-
-  async #recordEvaluateAndSettle(input: {
-    view: ReductionView;
-    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
-    result: KernelVerifiedActionResult;
-    claim?: AttemptLeaseClaim;
-  }): Promise<OrdinaryKernelStep> {
-    return this.#recordAndSettle({
-      view: input.view,
-      bundle: input.bundle,
-      ...this.#createResultRecord(input),
-      ...(input.claim ? { claim: input.claim } : {}),
-    });
   }
 
   #createResultRecord(input: {
@@ -1077,63 +1197,17 @@ export class OrdinaryKernelCoordinator {
     }
     const checkpoint = input.checkpoint ?? recorded.checkpoints.get(recordedAttempt.checkpoint_id!);
     if (!checkpoint) throw new Error(`attempt ${recordedAttempt.id} has no exact settlement checkpoint`);
-    let defaultPlan: Promise<OrdinaryKernelSettlementPlan> | null = null;
-    const deriveDefaultPlan = (): Promise<OrdinaryKernelSettlementPlan> => {
-      defaultPlan ??= (async () => {
-        const decision = createPipelineDecisionRecord({
-          attempt: recordedAttempt,
-          result: input.record,
-          evaluated: input.evaluated,
-          created_at: this.#now(),
-        });
-        const targetStageId = nextStageId({
-          view: recorded,
-          stage: input.stage,
-          outcome: input.evaluated.outcome,
-        });
-        const nextAttempts = targetStageId === null
-          ? []
-          : [await this.#nextAttempt({
-            view: recorded,
-            current: recordedAttempt,
-            current_result: input.record,
-            decision,
-            bundle: input.bundle,
-            target_stage_id: targetStageId,
-          })];
-        return {
-          decision,
-          outcome: input.evaluated.outcome,
-          input_records: [input.record],
-          checkpoints: [],
-          next_attempts: nextAttempts,
-        };
-      })();
-      return defaultPlan;
-    };
-    const settlement = this.#settlementPlanner === null
-      ? await deriveDefaultPlan()
-      : await this.#settlementPlanner.plan({
-        view: recorded,
-        stage: input.stage,
-        attempt: recordedAttempt,
-        result: input.record,
-        checkpoint,
-        bundle: input.bundle,
-        evaluated: input.evaluated,
-        default_plan: deriveDefaultPlan,
-      });
-    this.#assertSettlementPlan(recorded, input.stage, recordedAttempt, input.record, settlement);
-    const settleRecords = new Map<string, ExecutionRecord>(settlement.input_records
-      .map((candidate) => [candidate.id, candidate]));
-    settleRecords.set(settlement.decision.id, settlement.decision);
-    const settleCheckpoints = new Map(settlement.checkpoints
-      .map((candidate) => [candidate.id, candidate]));
-    await this.#apply({
-      ...recorded,
-      records: settleRecords,
-      checkpoints: settleCheckpoints,
-    }, {
+    const settlement = await this.#planSettlement({
+      view: recorded,
+      bundle: input.bundle,
+      attempt: recordedAttempt,
+      record: input.record,
+      stage: input.stage,
+      evaluated: input.evaluated,
+      checkpoint,
+      additional_input_records: [],
+    });
+    return this.#applyPlannedSettlement(recorded, recordedAttempt, input.stage.id, settlement, {
       type: "settle",
       command_id: transitionId("settle", {
         attempt: recordedAttempt.id,
@@ -1147,21 +1221,153 @@ export class OrdinaryKernelCoordinator {
         ? {}
         : { next_dependencies: settlement.next_dependencies }),
     });
-    const finalView = await this.#load(recorded.run.id, null);
-    return this.#step("settled", finalView, recordedAttempt.id, input.stage.id);
+  }
+
+  async #correctAndSettle(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    checkpoint: AttemptCheckpoint;
+    evidence: DecisionRecord;
+    record: ResultRecord;
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+    claim: AttemptLeaseClaim;
+  }): Promise<OrdinaryKernelStep> {
+    const attempt = input.view.current_attempt!;
+    const planningView = {
+      ...input.view,
+      records: mapWith(input.view.records, input.record, input.evidence),
+    };
+    const settlement = await this.#planSettlement({
+      view: planningView,
+      bundle: input.bundle,
+      attempt,
+      record: input.record,
+      stage: input.stage,
+      evaluated: input.evaluated,
+      checkpoint: input.checkpoint,
+      additional_input_records: [input.evidence],
+    });
+    return this.#applyPlannedSettlement(input.view, attempt, input.stage.id, settlement, {
+      type: "correct_and_settle",
+      command_id: transitionId("correct-and-settle", {
+        attempt: attempt.id,
+        result: input.record.id,
+        evidence: input.evidence.id,
+        decision: settlement.decision.id,
+      }),
+      attempt_id: attempt.id,
+      result_record_id: input.record.id,
+      invalid_result_evidence_record_id: input.evidence.id,
+      decision_record_id: settlement.decision.id,
+      outcome: settlement.outcome,
+      next_attempts: settlement.next_attempts,
+      ...(settlement.next_dependencies === undefined
+        ? {}
+        : { next_dependencies: settlement.next_dependencies }),
+    }, input.claim);
+  }
+
+  async #applyPlannedSettlement(
+    view: ReductionView,
+    attempt: KernelAttempt,
+    stageId: string,
+    settlement: OrdinaryKernelSettlementPlan,
+    command: Extract<KernelCommand, { type: "settle" | "correct_and_settle" }>,
+    claim?: AttemptLeaseClaim,
+  ): Promise<OrdinaryKernelStep> {
+    const records = new Map<string, ExecutionRecord>(settlement.input_records
+      .map((candidate) => [candidate.id, candidate]));
+    records.set(settlement.decision.id, settlement.decision);
+    await this.#apply({
+      ...view,
+      records,
+      checkpoints: new Map(settlement.checkpoints.map((candidate) => [candidate.id, candidate])),
+    }, command, claim);
+    return this.#step("settled", await this.#load(view.run.id, null), attempt.id, stageId);
+  }
+
+  async #planSettlement(input: {
+    view: ReductionView;
+    bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
+    attempt: KernelAttempt;
+    record: ResultRecord;
+    stage: Exclude<CompiledPipelineStage, { kind: "effect" | "wait" }>;
+    evaluated: EvaluatedKernelResult;
+    checkpoint: AttemptCheckpoint;
+    additional_input_records: readonly ExecutionRecord[];
+  }): Promise<OrdinaryKernelSettlementPlan> {
+    let defaultPlan: Promise<OrdinaryKernelSettlementPlan> | null = null;
+    const deriveDefaultPlan = (): Promise<OrdinaryKernelSettlementPlan> => {
+      defaultPlan ??= (async () => {
+        const decision = createPipelineDecisionRecord({
+          attempt: input.attempt,
+          result: input.record,
+          additional_input_records: input.additional_input_records,
+          evaluated: input.evaluated,
+          created_at: this.#now(),
+        });
+        const targetStageId = nextStageId({
+          view: input.view,
+          stage: input.stage,
+          outcome: input.evaluated.outcome,
+        });
+        const nextAttempts = targetStageId === null
+          ? []
+          : [await this.#nextAttempt({
+            view: input.view,
+            current: input.attempt,
+            current_result: input.record,
+            decision,
+            bundle: input.bundle,
+            target_stage_id: targetStageId,
+            additional_context_records: input.additional_input_records,
+          })];
+        return {
+          decision,
+          outcome: input.evaluated.outcome,
+          input_records: [input.record, ...input.additional_input_records]
+            .sort((left, right) => compareCodeUnits(left.id, right.id)),
+          checkpoints: [],
+          next_attempts: nextAttempts,
+        };
+      })();
+      return defaultPlan;
+    };
+    const settlement = this.#settlementPlanner === null
+      ? await deriveDefaultPlan()
+      : await this.#settlementPlanner.plan({
+        view: input.view,
+        stage: input.stage,
+        attempt: input.attempt,
+        result: input.record,
+        checkpoint: input.checkpoint,
+        bundle: input.bundle,
+        evaluated: input.evaluated,
+        additional_input_records: input.additional_input_records,
+        default_plan: deriveDefaultPlan,
+      });
+    this.#assertSettlementPlan(
+      input.view,
+      input.stage,
+      input.attempt,
+      [input.record, ...input.additional_input_records],
+      settlement,
+    );
+    return settlement;
   }
 
   #assertSettlementPlan(
     view: ReductionView,
     stage: CompiledPipelineStage,
     attempt: KernelAttempt,
-    currentResult: ResultRecord,
+    requiredInputs: readonly ExecutionRecord[],
     plan: OrdinaryKernelSettlementPlan,
   ): void {
     if (
       plan.decision.pipeline_run_id !== view.run.id ||
-      !stage.on[plan.outcome] ||
-      !plan.decision.input_record_ids.includes(currentResult.id)
+      !stage.on[plan.outcome] || requiredInputs.some((record) =>
+        !plan.decision.input_record_ids.includes(record.id))
     ) throw new Error("ordinary settlement planner returned an unauthorized transition");
     const records = [...plan.input_records]
       .sort((left, right) => compareCodeUnits(left.id, right.id));
@@ -1189,6 +1395,7 @@ export class OrdinaryKernelCoordinator {
     decision: DecisionRecord;
     bundle: Awaited<ReturnType<KernelDefinitionBundlePort["resolveExactDefinitionBundle"]>>;
     target_stage_id: string;
+    additional_context_records?: readonly ExecutionRecord[];
   }): Promise<KernelAttempt> {
     const target = stageFor(input.view.manifest, input.target_stage_id);
     const workInputs = await this.#store.loadAttemptRequestInputs({
@@ -1238,6 +1445,7 @@ export class OrdinaryKernelCoordinator {
       target_scope: { kind: "stage", stage_id: target.id },
       request_inputs: workInputs,
       checkpoint_override: checkpoints,
+      additional_context_records: input.additional_context_records,
     });
   }
 
@@ -1250,23 +1458,11 @@ export class OrdinaryKernelCoordinator {
   ): Promise<OrdinaryKernelStep> {
     const attempt = view.current_attempt;
     if (!attempt) throw new Error("attempt terminal transition requires its exact aggregate");
-    let terminalDiagnostics = diagnostics;
-    if (
-      terminalDiagnostics === undefined && outcome === "needs_human" &&
-      attempt.pending_result?.invalid_result_evidence
-    ) {
-      const evidence = createInvalidResultEvidenceRecord({
-        attempt,
-        pointer: attempt.pending_result.invalid_result_evidence,
-        created_at: this.#now(),
-      });
-      terminalDiagnostics = { records: [evidence], new_record_ids: [evidence.id] };
-    }
     const prepared = await this.#prepareTerminalTransition({
       view,
       outcome,
       reason,
-      diagnostics: terminalDiagnostics,
+      diagnostics,
     });
     await this.#apply({
       ...prepared.exact,
@@ -1335,7 +1531,13 @@ export class OrdinaryKernelCoordinator {
         attempt.scope.stage_id !== RUNTIME_PROVISION_STAGE_ID ||
         attempt.checkpoint_id !== null || Object.keys(view.run.active_effect_versions).length !== 0
       ) throw new Error("terminal transition has no exact runtime resource or pre-provision proof");
-      exact = await this.#load(view.run.id, attempt.id);
+      exact = await this.#load(
+        view.run.id,
+        attempt.id,
+        diagnosticRecords
+          .filter(({ id }) => !newDiagnosticIdSet.has(id))
+          .map(({ id }) => id),
+      );
       resourceDisposition = { kind: "pre_provision" };
     } else {
       const bundle = await this.#bundles.resolveExactDefinitionBundle({
@@ -1374,6 +1576,23 @@ export class OrdinaryKernelCoordinator {
       resource_disposition: resourceDisposition,
       new_diagnostics: diagnosticRecords.filter(({ id }) => newDiagnosticIdSet.has(id)),
     };
+  }
+
+  async #loadInvalidResultEvidenceRecord(
+    attempt: KernelAttempt,
+    pointer: Exclude<
+      NonNullable<KernelAttempt["pending_result"]>["invalid_result_evidence"],
+      null
+    >,
+  ): Promise<DecisionRecord> {
+    const recordId = invalidResultEvidenceRecordId(attempt, pointer);
+    const exact = await this.#load(attempt.pipeline_run_id, attempt.id, [recordId]);
+    const record = exact.records.get(recordId);
+    if (!record || record.kind !== "decision") {
+      throw new Error(`attempt ${attempt.id} has no exact invalid-result evidence Record`);
+    }
+    assertExactInvalidResultEvidenceRecord({ attempt, pointer, record });
+    return record;
   }
 
   async #load(

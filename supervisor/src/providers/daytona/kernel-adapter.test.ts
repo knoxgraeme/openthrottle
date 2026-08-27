@@ -41,6 +41,8 @@ import {
 } from "../../pipeline/kernel/steering.js";
 import { DaytonaKernelAdapter } from "./kernel-adapter.js";
 
+const REPLAYED_EVIDENCE_OBSERVED_AT = "2026-08-20T12:00:00.000Z";
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -655,8 +657,8 @@ function checkpointRuntimeResult(
   request: KernelWorkActionRequest,
   checkpoint: ReturnType<typeof checkpointWire>,
   state: "command" | "inspect",
+  evidence = invalidResultEvidenceArtifact(request),
 ): Buffer {
-  const evidence = invalidResultEvidenceArtifact(request);
   return Buffer.from(JSON.stringify({
     schema: "openthrottle.kernel-runtime-result/v1",
     pipeline_run_id: request.pipeline_run_id,
@@ -686,8 +688,11 @@ function checkpointRuntimeResult(
   }));
 }
 
-function invalidResultEvidenceArtifact(request: KernelWorkActionRequest) {
-  const bytes = Buffer.from(`${canonicalJson({
+function invalidResultEvidenceArtifact(
+  request: KernelWorkActionRequest,
+  observedAt = REPLAYED_EVIDENCE_OBSERVED_AT,
+) {
+  const payload = {
     schema: "openthrottle.invalid-result-evidence/v1",
     pipeline_run_id: request.pipeline_run_id,
     attempt_id: request.attempt_id,
@@ -699,10 +704,12 @@ function invalidResultEvidenceArtifact(request: KernelWorkActionRequest) {
     diagnostics: [{ path: "/payload", detail: "result needs correction" }],
     runner_stdout_tail: "",
     runner_stderr_tail: "",
-    observed_at: "2026-08-20T12:00:00.000Z",
-  })}\n`);
+    observed_at: observedAt,
+  } as const;
+  const bytes = Buffer.from(`${canonicalJson(payload)}\n`);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   return {
+    payload,
     bytes,
     descriptor: {
       schema: "openthrottle.evidence-artifact-descriptor/v1",
@@ -715,15 +722,19 @@ function invalidResultEvidenceArtifact(request: KernelWorkActionRequest) {
   } as const;
 }
 
-function attemptForensicsArtifact(request: KernelWorkActionRequest) {
+function attemptForensicsArtifact(
+  request: KernelWorkActionRequest,
+  options: { workRetryOrdinal?: number; observedAt?: string } = {},
+) {
   const operationalSignature = "9".repeat(64);
-  const bytes = Buffer.from(`${canonicalJson({
+  const payload = {
     schema: "openthrottle.attempt-forensics/v1",
     pipeline_run_id: request.pipeline_run_id,
     attempt_id: request.attempt_id,
     request_hash: request.request_hash,
     definition_bundle_hash: request.definition_bundle_hash,
     lease_id: request.lease_id,
+    work_retry_ordinal: options.workRetryOrdinal ?? 0,
     operational_signature: operationalSignature,
     exit_code: 1,
     runner_stdout_tail: "runner output",
@@ -731,10 +742,13 @@ function attemptForensicsArtifact(request: KernelWorkActionRequest) {
     result_path_state: { state: "missing" },
     session_event_state: { state: "present", bytes: 100, sha256: "8".repeat(64) },
     workspace_git_status: { state: "present", summary: " M src/work.ts", detail: "" },
-  })}\n`);
+    observed_at: options.observedAt ?? REPLAYED_EVIDENCE_OBSERVED_AT,
+  } as const;
+  const bytes = Buffer.from(`${canonicalJson(payload)}\n`);
   const sha256 = createHash("sha256").update(bytes).digest("hex");
   return {
     operationalSignature,
+    payload,
     bytes,
     descriptor: {
       schema: "openthrottle.evidence-artifact-descriptor/v1",
@@ -841,6 +855,7 @@ function correctionCheckpointExecution(
     }),
   }).correctResult(request, {
     lease_generation: 0,
+    work_retry_ordinal: 0,
     heartbeat_interval_ms: 10,
     on_heartbeat: vi.fn().mockResolvedValue(undefined),
   });
@@ -938,15 +953,22 @@ describe("DaytonaKernelAdapter", () => {
           : pointer,
       }));
 
-      await expect(adapterFor(sandbox, { put }).executeWork(request, {
+      const outcome = await adapterFor(sandbox, { put }).executeWork(request, {
         lease_generation: 0,
+        work_retry_ordinal: 0,
         heartbeat_interval_ms: 10,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
         on_session: vi.fn().mockResolvedValue(undefined),
-      })).resolves.toMatchObject({
+      });
+      expect(outcome).toMatchObject({
         state: kind === "command" ? "work_complete" : "result_pending",
         checkpoint: { input_subject: request.input_subject, output_subject: null },
       });
+      if (kind === "inspect") {
+        expect(outcome).toMatchObject({
+          invalid_result_evidence: { observed_at: REPLAYED_EVIDENCE_OBSERVED_AT },
+        });
+      }
       expect(put).toHaveBeenCalledTimes(kind === "inspect" ? 2 : 1);
     },
   );
@@ -962,6 +984,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -1000,6 +1023,7 @@ describe("DaytonaKernelAdapter", () => {
     const adapter = adapterFor(sandbox);
     const callbacks = (lease_generation: number) => ({
       lease_generation,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -1032,6 +1056,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -1064,11 +1089,13 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
     })).resolves.toMatchObject({ state: "work_failed" });
     expect(sandbox.updateEnv).toHaveBeenCalledWith(expect.objectContaining({
+      OT_ACTION_WORK_RETRY_ORDINAL: "0",
       OT_LEASE_GENERATION_FENCE_FILE:
         "/var/lib/openthrottle/action-fences/attempt-1/lease-generation.json",
       OT_LEASE_GENERATION_LOCK_FILE:
@@ -1141,6 +1168,7 @@ describe("DaytonaKernelAdapter", () => {
     await dispatchIntegration(beforeAction);
     const outcome = await adapter.executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn().mockResolvedValue(undefined),
@@ -1206,6 +1234,7 @@ describe("DaytonaKernelAdapter", () => {
     const onHeartbeat = vi.fn().mockResolvedValue(undefined);
     const execution = adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: onHeartbeat,
       on_session: onSession,
@@ -1276,6 +1305,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox, blobStore).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -1341,6 +1371,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox, { read: vi.fn().mockReturnValue(bytes) }).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2016,6 +2047,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 1,
       on_heartbeat: vi.fn().mockRejectedValue(lost),
       on_session: vi.fn(),
@@ -2147,6 +2179,7 @@ describe("DaytonaKernelAdapter", () => {
     const adapter = adapterFor(sandbox);
     const callbacks = (lease_generation: number) => ({
       lease_generation,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2172,6 +2205,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2202,6 +2236,7 @@ describe("DaytonaKernelAdapter", () => {
     const adapter = adapterFor(sandbox);
     const callbacks = (lease_generation: number) => ({
       lease_generation,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2224,7 +2259,7 @@ describe("DaytonaKernelAdapter", () => {
     expect(sandbox.files.get(staleStage)).toBeDefined();
   });
 
-  it("settles promptly when the asynchronous entrypoint exits without a sealed result", async () => {
+  it("settles promptly and collects generation-zero forensics during generation-one recovery", async () => {
     vi.useFakeTimers();
     try {
       const request = workRequest();
@@ -2253,7 +2288,8 @@ describe("DaytonaKernelAdapter", () => {
         {},
         { task_timeout_seconds: 60 },
       ).executeWork(request, {
-        lease_generation: 0,
+        lease_generation: 1,
+        work_retry_ordinal: 0,
         heartbeat_interval_ms: 10_000,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
         on_session: vi.fn(),
@@ -2272,8 +2308,14 @@ describe("DaytonaKernelAdapter", () => {
         forensics: {
           blob: pointer,
           operational_signature: forensics.operationalSignature,
+          observed_at: REPLAYED_EVIDENCE_OBSERVED_AT,
         },
       });
+      expect(forensics.payload).toMatchObject({
+        work_retry_ordinal: 0,
+        observed_at: REPLAYED_EVIDENCE_OBSERVED_AT,
+      });
+      expect(forensics.payload).not.toHaveProperty("lease_generation");
       expect(settledPromptly).toBe(true);
       const sessionId = createdSessionId(sandbox);
       expect(sandbox.process.getSessionCommand).toHaveBeenCalledWith(
@@ -2286,6 +2328,45 @@ describe("DaytonaKernelAdapter", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("accepts replayed forensics but rejects evidence beyond the supervisor clock bound", async () => {
+    const collect = (observedAt: string) => {
+      const request = workRequest();
+      const forensics = attemptForensicsArtifact(request, { observedAt });
+      const resultDirectory = "/var/lib/openthrottle/action-results/attempt-1/work-lease-1";
+      let terminated = false;
+      const sandbox = sandboxWith(async (path) => {
+        if (terminated && path === `${resultDirectory}/forensics.json`) {
+          return Buffer.from(`${canonicalJson(forensics.descriptor)}\n`);
+        }
+        if (terminated && path === `${resultDirectory}/${forensics.descriptor.file}`) {
+          return forensics.bytes;
+        }
+        throw new Error("404 not found");
+      });
+      sandbox.process.executeSessionCommand.mockResolvedValue(undefined);
+      sandbox.process.deleteSession.mockImplementation(async () => { terminated = true; });
+      const pointer = attemptForensicsPointer(forensics);
+      return adapterFor(sandbox, {
+        put: vi.fn().mockReturnValue({ pointer }),
+      }).executeWork(request, {
+        lease_generation: 0,
+        work_retry_ordinal: 0,
+        heartbeat_interval_ms: 10,
+        on_heartbeat: vi.fn().mockResolvedValue(undefined),
+        on_session: vi.fn(),
+      });
+    };
+
+    await expect(collect(REPLAYED_EVIDENCE_OBSERVED_AT)).resolves.toMatchObject({
+      state: "work_failed",
+      forensics: { observed_at: REPLAYED_EVIDENCE_OBSERVED_AT },
+    });
+    const futureObservedAt = new Date(Date.now() + (6 * 60 * 1_000)).toISOString();
+    await expect(collect(futureObservedAt)).rejects.toThrow(
+      /runtime evidence timestamp exceeds the supervisor clock bound/,
+    );
   });
 
   it("creates a fresh Daytona process session for correction and reuses it only on recovery", async () => {
@@ -2303,6 +2384,7 @@ describe("DaytonaKernelAdapter", () => {
     }, { task_timeout_seconds: 60 });
     const callbacks = (leaseGeneration: number) => ({
       lease_generation: leaseGeneration,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10_000,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2335,6 +2417,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 1,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2381,6 +2464,7 @@ describe("DaytonaKernelAdapter", () => {
       put: vi.fn().mockReturnValue({ pointer }),
     }).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2388,7 +2472,11 @@ describe("DaytonaKernelAdapter", () => {
       state: "work_failed",
       retryable: true,
       reason: "Daytona action launch omitted its command identity; session termination was verified",
-      forensics: { blob: pointer, operational_signature: forensics.operationalSignature },
+      forensics: {
+        blob: pointer,
+        operational_signature: forensics.operationalSignature,
+        observed_at: REPLAYED_EVIDENCE_OBSERVED_AT,
+      },
     });
     const sessionId = createdSessionId(sandbox);
     expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
@@ -2404,6 +2492,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2428,6 +2517,7 @@ describe("DaytonaKernelAdapter", () => {
 
     await expect(adapterFor(sandbox).executeWork(request, {
       lease_generation: 0,
+      work_retry_ordinal: 0,
       heartbeat_interval_ms: 10,
       on_heartbeat: vi.fn().mockResolvedValue(undefined),
       on_session: vi.fn(),
@@ -2474,6 +2564,7 @@ describe("DaytonaKernelAdapter", () => {
       );
       const execution = adapter.executeWork(request, {
         lease_generation: 0,
+        work_retry_ordinal: 0,
         heartbeat_interval_ms: 10_000,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
         on_session: vi.fn(),
@@ -2484,7 +2575,11 @@ describe("DaytonaKernelAdapter", () => {
         state: "work_failed",
         retryable: true,
         reason: expect.stringMatching(/termination was verified/),
-        forensics: { blob: pointer, operational_signature: forensics.operationalSignature },
+        forensics: {
+          blob: pointer,
+          operational_signature: forensics.operationalSignature,
+          observed_at: REPLAYED_EVIDENCE_OBSERVED_AT,
+        },
       });
       const sessionId = createdSessionId(sandbox);
       expect(sandbox.process.deleteSession).toHaveBeenCalledWith(sessionId);
@@ -2515,6 +2610,7 @@ describe("DaytonaKernelAdapter", () => {
       sandbox.process.getSession.mockResolvedValue({ sessionId: "kernel-attempt-1", commands: [] });
       const execution = adapterFor(sandbox).executeWork(request, {
         lease_generation: 0,
+        work_retry_ordinal: 0,
         heartbeat_interval_ms: 10_000,
         on_heartbeat: vi.fn().mockResolvedValue(undefined),
         on_session: vi.fn(),

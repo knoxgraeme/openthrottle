@@ -177,6 +177,23 @@ function promotionDecision(): DecisionRecord {
   };
 }
 
+function correctionEvidence(marker = "current"): DecisionRecord {
+  return {
+    ...promotionDecision(),
+    id: `decision-correction-evidence-${marker}`,
+    reducer: "core/invalid-result-evidence@1",
+    payload_schema: "openthrottle.invalid-result-evidence/v1",
+    payload: { blob: {
+      algorithm: "sha256",
+      digest: marker === "current" ? "e".repeat(64) : digestCanonicalJson(marker),
+      bytes: 100,
+      encoding: "utf-8",
+      media_type: "application/json",
+      payload_schema: "openthrottle.invalid-result-evidence/v1",
+    } },
+  };
+}
+
 function runtimeDelivery(kind: "create" | "start"): DeliveryRecord {
   return {
     schema: EXECUTION_RECORD_SCHEMA,
@@ -286,6 +303,7 @@ function completedAttempt(input: {
   evaluated?: { evaluator: string; outcome: string; reason: string };
   request: KernelAttemptRequestInputs;
   settled?: boolean;
+  additional_input_records?: readonly ExecutionRecord[];
 }): {
   attempt: KernelAttempt;
   checkpoint: AttemptCheckpoint;
@@ -340,6 +358,7 @@ function completedAttempt(input: {
   const decision = createPipelineDecisionRecord({
     attempt: recorded,
     result,
+    additional_input_records: input.additional_input_records,
     evaluated,
     created_at: NOW,
   });
@@ -366,6 +385,7 @@ function completedAttempt(input: {
       checkpoint,
       result,
       decision,
+      decision_input_records: [result, ...(input.additional_input_records ?? [])],
       request_inputs: input.request,
     },
   };
@@ -458,6 +478,7 @@ function ordinaryInput(input: {
   outcome?: string;
   evaluator?: string;
   reason?: string;
+  additional_input_records?: readonly ExecutionRecord[];
 }): OrdinaryInput {
   const selected = stage(input.attempt.scope.stage_id);
   if (selected.kind === "effect" || selected.kind === "wait") throw new Error("test stage is external");
@@ -474,6 +495,7 @@ function ordinaryInput(input: {
       outcome: input.outcome ?? "success",
       reason: input.reason ?? "validated_semantic_result",
     },
+    additional_input_records: input.additional_input_records,
     default_plan: vi.fn(async () => {
       throw new Error("unexpected default plan");
     }),
@@ -585,8 +607,13 @@ describe("KernelStructuredSettlementPlanner", () => {
       },
       request: secondRequest,
     });
+    const correction = correctionEvidence("first-sibling");
     const first = completedAttempt({
-      pending: firstPending, output_subject: UNIT_A, request: firstRequest, settled: true,
+      pending: firstPending,
+      output_subject: UNIT_A,
+      request: firstRequest,
+      settled: true,
+      additional_input_records: [correction],
     });
     const second = completedAttempt({ pending: secondPending, output_subject: UNIT_B, request: secondRequest });
     store.requests.set(firstPending.id, firstRequest);
@@ -598,7 +625,6 @@ describe("KernelStructuredSettlementPlanner", () => {
       completed: [frontierMemberKey(first.attempt)],
     });
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
-
     const settlement = await planner.plan(ordinaryInput({
       attempt: second.attempt,
       checkpoint: second.checkpoint,
@@ -617,6 +643,10 @@ describe("KernelStructuredSettlementPlanner", () => {
     ].sort());
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_record_ids.includes("decision-admission-promotion"))).toBe(true);
+    expect(settlement.decision.input_record_ids).toContain(correction.id);
+    expect(settlement.input_records.map(({ id }) => id)).toContain(correction.id);
+    expect(settlement.next_attempts.every((attempt) =>
+      attempt.context_record_ids.includes(correction.id))).toBe(true);
     expect(store.reads[0]).toMatchObject({
       scope_kind: "loop_item",
       parent_attempt_id: "attempt-provision",
@@ -1082,12 +1112,14 @@ describe("KernelStructuredSettlementPlanner", () => {
     };
     store.requests.set(pending.id, request);
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+    const correction = correctionEvidence();
 
     const settlement = await planner.plan(ordinaryInput({
       attempt: completed.attempt,
       checkpoint: completed.checkpoint,
       result: selectorResult,
       view: view({ attempts: [completed.attempt], current: completed.attempt, current_subject: INTEGRATED }),
+      additional_input_records: [correction],
     }));
 
     const canonicalPersonas = [...personas].sort((left, right) =>
@@ -1108,6 +1140,9 @@ describe("KernelStructuredSettlementPlanner", () => {
       attempt.context_checkpoint_ids.includes(boundary.id))).toBe(true);
     expect(settlement.next_attempts.every((attempt) =>
       attempt.context_record_ids.includes(push.id))).toBe(true);
+    expect(settlement.decision.input_record_ids).toContain(correction.id);
+    expect(settlement.next_attempts.every((attempt) =>
+      attempt.context_record_ids.includes(correction.id))).toBe(true);
   });
 
   it("fans review evidence into validation and preserves runtime identity for edit remediation", async () => {
@@ -1175,6 +1210,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     store.requests.set(secondPending.id, secondRequest);
     store.settled = [first.evidence];
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+    const correction = correctionEvidence();
     const fanoutSettlement = await planner.plan(ordinaryInput({
       attempt: second.attempt,
       checkpoint: second.checkpoint,
@@ -1188,6 +1224,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       outcome: "semantic_repair_required",
       evaluator: "core/review-outcome@1",
       reason: "blocking_review_finding",
+      additional_input_records: [correction],
     }));
     expect(fanoutSettlement.next_attempts).toHaveLength(1);
     expect(fanoutSettlement.next_attempts[0]!.scope).toEqual({
@@ -1199,11 +1236,15 @@ describe("KernelStructuredSettlementPlanner", () => {
       first.decision.id,
       second.result.id,
       fanoutSettlement.decision.id,
+      correction.id,
     ]));
+    expect(fanoutSettlement.decision.input_record_ids).toContain(correction.id);
+    expect(fanoutSettlement.input_records.map(({ id }) => id)).toContain(correction.id);
 
     const validationRequest = requestInputs({
       records: [
         ...runtime,
+        correction,
         first.result,
         first.decision,
         second.result,
@@ -1240,6 +1281,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       outcome: "semantic_repair_required",
       evaluator: "core/review-outcome@1",
       reason: "blocking_review_finding",
+      additional_input_records: [correction],
     }));
     expect(remediation.next_attempts[0]!.scope).toEqual({ kind: "stage", stage_id: "final_repair" });
     expect(remediation.next_attempts[0]).toMatchObject({
@@ -1248,8 +1290,11 @@ describe("KernelStructuredSettlementPlanner", () => {
       input_subject: INTEGRATED,
       context_checkpoint_ids: [boundary.id],
     });
+    expect(remediation.decision.input_record_ids).toContain(correction.id);
+    expect(remediation.input_records.map(({ id }) => id)).toContain(correction.id);
     expect(remediation.next_attempts[0]!.context_record_ids).toEqual([
       ...runtime.map(({ id }) => id),
+      correction.id,
       validation.result.id,
       remediation.decision.id,
     ].sort());
@@ -1311,6 +1356,7 @@ describe("KernelStructuredSettlementPlanner", () => {
     store.requests.set(second.attempt.id, request);
     store.settled = [first.evidence];
     const planner = new KernelStructuredSettlementPlanner({ store, now: () => NOW });
+    const correction = correctionEvidence();
 
     const settlement = await planner.plan(ordinaryInput({
       attempt: second.attempt,
@@ -1325,6 +1371,7 @@ describe("KernelStructuredSettlementPlanner", () => {
       outcome: "failure",
       evaluator: "core/review-outcome@1",
       reason: "blocking_review_failure",
+      additional_input_records: [correction],
     }));
 
     expect(settlement.next_attempts).toHaveLength(1);
@@ -1343,8 +1390,11 @@ describe("KernelStructuredSettlementPlanner", () => {
       on: { success: { terminal: "failed" } },
     });
     expect(settlement.decision.id).not.toBe(second.decision.id);
+    expect(settlement.decision.input_record_ids).toContain(correction.id);
+    expect(settlement.input_records.map(({ id }) => id)).toContain(correction.id);
     expect(settlement.next_attempts[0]!.context_record_ids).toEqual([
       ...runtime.slice(0, 2).map(({ id }) => id),
+      correction.id,
       first.result.id,
       first.decision.id,
       second.result.id,

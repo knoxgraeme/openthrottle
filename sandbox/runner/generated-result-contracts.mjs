@@ -8,10 +8,11 @@ const repositoryRuntimePath = resolve(
 );
 const runtimeRoot = existsSync(imageRuntimePath) ? imageRuntimePath : repositoryRuntimePath;
 
-const [candidateRuntime, canonicalRuntime, validationRuntime] = await Promise.all([
+const [candidateRuntime, canonicalRuntime, validationRuntime, attemptEvidenceRuntime] = await Promise.all([
   import(pathToFileURL(resolve(runtimeRoot, "result-candidate.js")).href),
   import(pathToFileURL(resolve(runtimeRoot, "canonical.js")).href),
   import(pathToFileURL(resolve(runtimeRoot, "validation.js")).href),
+  import(pathToFileURL(resolve(runtimeRoot, "attempt-evidence.js")).href),
 ]);
 
 export const {
@@ -23,3 +24,11 @@ export const {
 } = candidateRuntime;
 export const { canonicalJson, digestCanonicalJson } = canonicalRuntime;
 export const { contractValidationIssue } = validationRuntime;
+export const {
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+  EVIDENCE_ARTIFACT_DESCRIPTOR_SCHEMA,
+  EVIDENCE_ARTIFACT_MAX_BYTES,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
+  validateAttemptEvidencePayload,
+  validateEvidenceArtifactDescriptor,
+} = attemptEvidenceRuntime;

@@ -3,6 +3,7 @@ import {
   type AttemptCheckpoint,
   type CompiledPipelineStage,
   type DecisionRecord,
+  type ExecutionRecord,
   type ResultRecord,
 } from "@openthrottle/contracts";
 import type { OrdinaryKernelSettlementPlanner } from "../pipeline/kernel/ordinary-coordinator.js";
@@ -170,12 +171,13 @@ export function settleStructuredWaveDecision(input: {
   current_result: ResultRecord;
   current_decision: DecisionRecord;
   evidence: readonly StructuredWaveEvidence[];
+  additional_input_records?: readonly ExecutionRecord[];
   created_at: string;
 }): {
   decision: DecisionRecord;
   outcome: string;
   target_stage_id: string | null;
-  input_records: readonly ResultRecord[];
+  input_records: readonly ExecutionRecord[];
   aggregate: boolean;
 } {
   const transitions = input.evidence.map((evidence) => {
@@ -187,19 +189,47 @@ export function settleStructuredWaveDecision(input: {
     };
   });
   const targets = new Set(transitions.map(({ target_stage_id: target }) => target));
+  const additionalInputs = input.additional_input_records ?? [];
+  const lineageInputs = [...new Map([
+    ...input.evidence.flatMap((source) => source.decision_input_records
+      .filter(({ id }) => id !== source.result.id)),
+    ...additionalInputs,
+  ].map((record) => [record.id, record])).values()]
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
   if (targets.size === 1) {
     const outcome = structuredDecisionOutcome(input.current_decision);
+    const inputRecords = [...new Map([
+      input.current_result,
+      ...lineageInputs,
+    ].map((record) => [record.id, record])).values()]
+      .sort((left, right) => compareCodeUnits(left.id, right.id));
+    const currentInputIds = [...input.current_decision.input_record_ids].sort(compareCodeUnits);
+    const inputRecordIds = inputRecords.map(({ id }) => id);
+    const decision = currentInputIds.length === inputRecordIds.length &&
+        currentInputIds.every((id, index) => id === inputRecordIds[index])
+      ? input.current_decision
+      : createPipelineDecisionRecord({
+        attempt: input.current_attempt,
+        result: input.current_result,
+        additional_input_records: inputRecords
+          .filter(({ id }) => id !== input.current_result.id),
+        evaluated: decisionEvaluation(input.current_decision),
+        created_at: input.created_at,
+      });
     return {
-      decision: input.current_decision,
+      decision,
       outcome,
       target_stage_id: transitions[0]!.target_stage_id,
-      input_records: [input.current_result],
+      input_records: inputRecords,
       aggregate: false,
     };
   }
   const outcome = preferredDivergentOutcome(transitions.map((transition) => transition.outcome));
   const selected = transitions.find((transition) => transition.outcome === outcome)!;
-  const inputRecords = input.evidence.map(({ result }) => result)
+  const inputRecords = [...new Map([
+    ...input.evidence.map(({ result }) => result),
+    ...lineageInputs,
+  ].map((record) => [record.id, record])).values()]
     .sort((left, right) => compareCodeUnits(left.id, right.id));
   const decision = createPipelineDecisionRecord({
     attempt: input.current_attempt,
@@ -329,6 +359,10 @@ export async function loadCompletedStructuredWave(input: {
     decision: input.current_decision,
     checkpoint: ordinary.checkpoint,
     request_inputs: input.current_request,
+    decision_input_records: [
+      ordinary.result,
+      ...(ordinary.additional_input_records ?? []),
+    ],
   }));
   byAttempt.set(current.attempt.id, current);
   const missing = frontier.find(({ attempt_id }) => !byAttempt.has(attempt_id));

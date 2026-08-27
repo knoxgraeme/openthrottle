@@ -6,6 +6,8 @@ import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { stageAttemptForensics } from "./stage-attempt-forensics.mjs";
 
+const OBSERVED_AT = "2026-08-20T12:00:00.000Z";
+
 function git(repository, ...args) {
   return execFileSync("git", ["-C", repository, ...args], { encoding: "utf8" }).trim();
 }
@@ -51,6 +53,7 @@ describe("attempt forensics staging", () => {
 
       const descriptor = stageAttemptForensics({
         exitCode: 17,
+        now: () => new Date(OBSERVED_AT),
         env: {
           PATH: process.env.PATH,
           OT_ACTION_ROOT: actionRoot,
@@ -60,6 +63,7 @@ describe("attempt forensics staging", () => {
           OT_ACTION_FORENSICS_FILE: descriptorPath,
           OT_ACTION_RUNNER_STDOUT_FILE: stdoutPath,
           OT_ACTION_RUNNER_STDERR_FILE: stderrPath,
+          OT_ACTION_WORK_RETRY_ORDINAL: "3",
         },
       });
       const persistedDescriptor = JSON.parse(readFileSync(descriptorPath, "utf8"));
@@ -70,6 +74,7 @@ describe("attempt forensics staging", () => {
       expect(artifact).toMatchObject({
         schema: "openthrottle.attempt-forensics/v1",
         attempt_id: "attempt-1",
+        work_retry_ordinal: 3,
         exit_code: 17,
         result_path_state: { state: "present", bytes: 10 },
         session_event_state: { state: "present" },
@@ -78,6 +83,7 @@ describe("attempt forensics staging", () => {
         runner_stderr_tail:
           "[kernel-entrypoint 12:34:56] repository source component is not a physical directory\n",
         operational_signature: expect.stringMatching(/^[a-f0-9]{64}$/),
+        observed_at: OBSERVED_AT,
       });
       expect(Buffer.byteLength(artifact.runner_stdout_tail)).toBeLessThanOrEqual(16 * 1024);
 
@@ -97,6 +103,7 @@ describe("attempt forensics staging", () => {
       );
       const repeatedDescriptor = stageAttemptForensics({
         exitCode: 17,
+        now: () => new Date(OBSERVED_AT),
         env: {
           PATH: process.env.PATH,
           OT_ACTION_ROOT: actionRoot,
@@ -106,6 +113,7 @@ describe("attempt forensics staging", () => {
           OT_ACTION_FORENSICS_FILE: repeatedDescriptorPath,
           OT_ACTION_RUNNER_STDOUT_FILE: repeatedStdoutPath,
           OT_ACTION_RUNNER_STDERR_FILE: repeatedStderrPath,
+          OT_ACTION_WORK_RETRY_ORDINAL: "3",
         },
       });
       const repeatedArtifact = JSON.parse(readFileSync(
@@ -129,6 +137,7 @@ describe("attempt forensics staging", () => {
       writeFileSync(secondStderrPath, "different runner failure");
       const secondDescriptor = stageAttemptForensics({
         exitCode: 17,
+        now: () => new Date(OBSERVED_AT),
         env: {
           PATH: process.env.PATH,
           OT_ACTION_ROOT: actionRoot,
@@ -138,6 +147,7 @@ describe("attempt forensics staging", () => {
           OT_ACTION_FORENSICS_FILE: secondDescriptorPath,
           OT_ACTION_RUNNER_STDOUT_FILE: secondStdoutPath,
           OT_ACTION_RUNNER_STDERR_FILE: secondStderrPath,
+          OT_ACTION_WORK_RETRY_ORDINAL: "4",
         },
       });
       const secondArtifact = JSON.parse(readFileSync(
@@ -170,6 +180,7 @@ describe("attempt forensics staging", () => {
           OT_ACTION_FORENSICS_FILE: sealedDescriptorPath,
           OT_ACTION_RUNNER_STDOUT_FILE: join(sealedTransport, "runner.stdout.log"),
           OT_ACTION_RUNNER_STDERR_FILE: join(sealedTransport, "runner.stderr.log"),
+          OT_ACTION_WORK_RETRY_ORDINAL: "3",
         },
       })).toBeNull();
       expect(existsSync(sealedDescriptorPath)).toBe(false);

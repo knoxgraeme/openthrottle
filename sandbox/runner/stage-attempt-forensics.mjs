@@ -13,7 +13,8 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { runCapturedProcess } from "./bounded-process.mjs";
-import { ATTEMPT_FORENSICS_SCHEMA, stageJsonEvidenceArtifact } from "./evidence-artifact.mjs";
+import { stageJsonEvidenceArtifact } from "./evidence-artifact.mjs";
+import { ATTEMPT_FORENSICS_PAYLOAD_SCHEMA } from "./generated-result-contracts.mjs";
 import { repositoryGitEnvironment } from "./repository-authority.mjs";
 
 const MAX_TAIL_BYTES = 16 * 1024;
@@ -108,6 +109,12 @@ function requestAt(path) {
   return value;
 }
 
+function ordinal(value, label) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${label} is invalid`);
+  return parsed;
+}
+
 function hasSealedRuntimeResult(path, request) {
   let descriptor;
   try {
@@ -131,7 +138,7 @@ function hasSealedRuntimeResult(path, request) {
   }
 }
 
-export function stageAttemptForensics({ env = process.env, exitCode }) {
+export function stageAttemptForensics({ env = process.env, exitCode, now = () => new Date() }) {
   const resultPath = resolve(env.OT_ACTION_RESULT_FILE);
   const descriptorPath = resolve(env.OT_ACTION_FORENSICS_FILE);
   const stdoutPath = resolve(env.OT_ACTION_RUNNER_STDOUT_FILE);
@@ -141,6 +148,7 @@ export function stageAttemptForensics({ env = process.env, exitCode }) {
     throw new Error("forensics descriptor escapes the result directory");
   }
   const request = requestAt(resolve(env.OT_ACTION_REQUEST_FILE));
+  const workRetryOrdinal = ordinal(env.OT_ACTION_WORK_RETRY_ORDINAL, "work retry ordinal");
   if (hasSealedRuntimeResult(resultPath, request)) return null;
   const actionRoot = resolve(env.OT_ACTION_ROOT ?? "/var/lib/openthrottle/actions");
   const actionDirectory = join(actionRoot, request.attempt_id.replaceAll(":", "-"));
@@ -165,12 +173,13 @@ export function stageAttemptForensics({ env = process.env, exitCode }) {
     directory: dirname(resultPath),
     descriptorPath,
     value: {
-      schema: ATTEMPT_FORENSICS_SCHEMA,
+      schema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
       pipeline_run_id: request.pipeline_run_id,
       attempt_id: request.attempt_id,
       request_hash: request.request_hash,
       definition_bundle_hash: request.definition_bundle_hash,
       lease_id: request.lease_id,
+      work_retry_ordinal: workRetryOrdinal,
       operational_signature: operationalSignature,
       exit_code: exitCode,
       runner_stdout_tail: runnerStdoutTail,
@@ -178,6 +187,7 @@ export function stageAttemptForensics({ env = process.env, exitCode }) {
       result_path_state: resultPathState,
       session_event_state: sessionEventState,
       workspace_git_status: workspace,
+      observed_at: now().toISOString(),
     },
   });
 }

@@ -717,7 +717,9 @@ export class KernelExternalBoundaryCoordinator {
           });
           const retryRecords = [...new Map([
             ...[...failedInputs.context.records.values()]
-              .filter((candidate) => !isDaytonaRuntimeDelivery(candidate)),
+              .filter((candidate) =>
+                !isDaytonaRuntimeDelivery(candidate) &&
+                sandboxRecoveryAttemptId(candidate) === null),
             recoveryRecord!,
             result,
             decision,

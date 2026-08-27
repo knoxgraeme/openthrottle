@@ -74,6 +74,17 @@ type OrdinaryInput = Parameters<OrdinaryKernelSettlementPlanner["plan"]>[0];
 type ExternalInput = Parameters<KernelExternalSettlementPlanner["plan"]>[0];
 type StructuredInput = OrdinaryInput | ExternalInput;
 
+function ordinaryLineageRecords(
+  input: OrdinaryInput,
+  records: readonly ExecutionRecord[] = [],
+): ExecutionRecord[] {
+  return [...new Map([
+    ...records,
+    ...(input.additional_input_records ?? []),
+  ].map((record) => [record.id, record])).values()]
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
+}
+
 export interface KernelStructuredSettlementStore extends
   KernelAttemptRequestPort,
   KernelStructuredPlanningReadPort {}
@@ -88,9 +99,11 @@ function settledStructuredSiblingRecords(
 ): ExecutionRecord[] {
   // A divergent wave replaces the current member's transient decision with
   // one aggregate decision. Only sibling decisions already exist durably.
-  return evidence.flatMap((source) =>
-    source.attempt.id === currentAttemptId ? [] : [source.result, source.decision]
-  );
+  return [...new Map(evidence.flatMap((source) => [
+    ...(source.attempt.id === currentAttemptId ? [] : [source.result, source.decision]),
+    ...source.decision_input_records.filter(({ id }) => id !== source.result.id),
+  ]).map((record) => [record.id, record])).values()]
+    .sort((left, right) => compareCodeUnits(left.id, right.id));
 }
 
 function structuredWaveTerminalSettlement(input: {
@@ -115,10 +128,8 @@ function structuredWaveTerminalSettlement(input: {
       target_scope: { kind: "stage", stage_id: input.target_stage_id },
       request_inputs: input.request_inputs,
       checkpoint_override: [],
-      additional_context_records: settledStructuredSiblingRecords(
-        input.evidence,
-        input.ordinary.attempt.id,
-      ),
+      additional_context_records: ordinaryLineageRecords(input.ordinary,
+        settledStructuredSiblingRecords(input.evidence, input.ordinary.attempt.id)),
     })],
   };
 }
@@ -270,6 +281,7 @@ export class KernelStructuredSettlementPlanner implements
     const currentDecision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: input.result,
+      additional_input_records: ordinaryLineageRecords(input),
       evaluated: input.evaluated,
       created_at: this.#now(),
     });
@@ -277,7 +289,7 @@ export class KernelStructuredSettlementPlanner implements
       return {
         decision: currentDecision,
         outcome: input.evaluated.outcome,
-        input_records: [input.result],
+        input_records: ordinaryLineageRecords(input, [input.result]),
         checkpoints: [],
         next_attempts: [],
       };
@@ -296,6 +308,7 @@ export class KernelStructuredSettlementPlanner implements
       current_result: input.result,
       current_decision: currentDecision,
       evidence,
+      additional_input_records: input.additional_input_records,
       created_at: this.#now(),
     });
     if (settlement.target_stage_id === null) {
@@ -339,7 +352,7 @@ export class KernelStructuredSettlementPlanner implements
               source.request_inputs,
               input.view.manifest.pipeline_id,
             );
-            return promotion === null ? [] : [promotion];
+            return ordinaryLineageRecords(input, promotion === null ? [] : [promotion]);
           })(),
           bundle: input.bundle,
           manifest: input.view.manifest,
@@ -362,8 +375,9 @@ export class KernelStructuredSettlementPlanner implements
             input.view.manifest.pipeline_id,
           );
           return [
-            ...(settlement.aggregate ? settlement.input_records : []),
+            ...settlement.input_records,
             ...(promotion === null ? [] : [promotion]),
+            ...ordinaryLineageRecords(input),
           ];
         })(),
       }));
@@ -511,6 +525,7 @@ export class KernelStructuredSettlementPlanner implements
       decision,
       checkpoint: input.checkpoint,
       request_inputs: request,
+      decision_input_records: [input.result, ...deliveries],
     });
     integrations.set(integrationScope.item_id, {
       member_id: integrationScope.item_id,
@@ -638,6 +653,7 @@ export class KernelStructuredSettlementPlanner implements
     const decision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: input.result,
+      additional_input_records: ordinaryLineageRecords(input),
       evaluated: input.evaluated,
       created_at: this.#now(),
     });
@@ -655,7 +671,11 @@ export class KernelStructuredSettlementPlanner implements
     );
     const records = mergeCausalGithubPushContext({
       pipeline_run_id: input.view.run.id,
-      base_records: [input.result, decision, ...exactStructuredRuntimeRecords(request)],
+      base_records: ordinaryLineageRecords(input, [
+        input.result,
+        decision,
+        ...exactStructuredRuntimeRecords(request),
+      ]),
       inherited_records: [...request.context.records.values()],
     });
     const frontier = compileReviewFanoutFrontier({
@@ -681,7 +701,7 @@ export class KernelStructuredSettlementPlanner implements
     return {
       decision,
       outcome: input.evaluated.outcome,
-      input_records: [input.result],
+      input_records: ordinaryLineageRecords(input, [input.result]),
       checkpoints: [],
       next_attempts: frontier.attempts,
       next_dependencies: frontier.dependencies,
@@ -695,6 +715,7 @@ export class KernelStructuredSettlementPlanner implements
     const currentDecision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: input.result,
+      additional_input_records: ordinaryLineageRecords(input),
       evaluated: input.evaluated,
       created_at: this.#now(),
     });
@@ -702,7 +723,7 @@ export class KernelStructuredSettlementPlanner implements
       return {
         decision: currentDecision,
         outcome: input.evaluated.outcome,
-        input_records: [input.result],
+        input_records: ordinaryLineageRecords(input, [input.result]),
         checkpoints: [],
         next_attempts: [],
       };
@@ -721,6 +742,7 @@ export class KernelStructuredSettlementPlanner implements
       current_result: input.result,
       current_decision: currentDecision,
       evidence,
+      additional_input_records: input.additional_input_records,
       created_at: this.#now(),
     });
     if (settlement.target_stage_id === null) {
@@ -757,8 +779,10 @@ export class KernelStructuredSettlementPlanner implements
     if (boundaries.size !== 1) {
       throw new Error("structured review fanout does not share one exact accepted boundary");
     }
-    const additional = evidence.flatMap((source) => [source.result, source.decision])
-      .filter(({ id }) => id !== input.result.id && id !== settlement.decision.id);
+    const additional = ordinaryLineageRecords(
+      input,
+      settledStructuredSiblingRecords(evidence, input.attempt.id),
+    );
     return {
       decision: settlement.decision,
       outcome: settlement.outcome,
@@ -790,6 +814,7 @@ export class KernelStructuredSettlementPlanner implements
     const decision = createPipelineDecisionRecord({
       attempt: input.attempt,
       result: input.result,
+      additional_input_records: ordinaryLineageRecords(input),
       evaluated: input.evaluated,
       created_at: this.#now(),
     });
@@ -804,7 +829,7 @@ export class KernelStructuredSettlementPlanner implements
     return {
       decision,
       outcome: input.evaluated.outcome,
-      input_records: [input.result],
+      input_records: ordinaryLineageRecords(input, [input.result]),
       checkpoints: [],
       next_attempts: [createBlockingReviewRemediationAttempt({
         pipeline_run_id: input.view.run.id,
@@ -817,6 +842,7 @@ export class KernelStructuredSettlementPlanner implements
         decision,
         checkpoints: [...request.context.checkpoints.values()],
         runtime_delivery_records: [...request.context.records.values()],
+        additional_context_records: input.additional_input_records,
         bundle: input.bundle,
         manifest: input.view.manifest,
       })],

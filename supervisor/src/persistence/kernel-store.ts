@@ -4,9 +4,13 @@ import {
   compareCodeUnits,
   DEFINITION_BUNDLE_SCHEMA,
   digestCanonicalJson,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   validateAttemptCheckpoint,
+  validateAttemptForensicsPayload,
   validateEffectIntent,
   validateExecutionRecord,
+  validateInvalidResultEvidencePayload,
+  type AttemptForensicsPayload,
   type AttemptCheckpoint,
   type BlobPointer,
   type CompiledPipelineManifest,
@@ -16,6 +20,7 @@ import {
   type ExecutionRecord,
   type ExecutionRecordPayloadRegistry,
   type JsonValue,
+  type InvalidResultEvidencePayload,
   type RecordPayload,
 } from "@openthrottle/contracts";
 import type {
@@ -67,9 +72,9 @@ import {
 import { reduceKernelRecoveryQuarantine } from "../pipeline/kernel/reducer.js";
 import {
   ATTEMPT_FORENSICS_REDUCER,
+  INVALID_RESULT_EVIDENCE_REDUCER,
+  assertExactInvalidResultEvidenceRecord,
   attemptForensicsRecordId,
-  parseAttemptForensicsPayload,
-  type AttemptForensicsPayload,
 } from "../pipeline/kernel/attempt-evidence.js";
 import {
   transitionApplicationDisposition,
@@ -373,10 +378,7 @@ export class SqliteKernelStore implements
       const replacementAttempts = new Map(bundle.attempt_writes.flatMap((write) =>
         write.kind === "replace" ? [[write.attempt.id, write.attempt] as const] : []));
       for (const record of bundle.append_records) {
-        this.#insertRecord(
-          record,
-          record.kind === "result" ? replacementAttempts.get(record.attempt_id) : undefined,
-        );
+        this.#insertRecord(record, replacementAttempts);
       }
       for (const checkpoint of bundle.append_checkpoints) this.#insertCheckpoint(checkpoint);
       for (const write of bundle.attempt_writes) {
@@ -715,7 +717,8 @@ export class SqliteKernelStore implements
     if (!Number.isSafeInteger(input.work_retry_ordinal) || input.work_retry_ordinal < 0) {
       throw new Error("attempt forensics ordinal is invalid");
     }
-    const id = attemptForensicsRecordId(input.attempt_id, input.work_retry_ordinal);
+    const attempt = this.#attemptById(input.attempt_id, input.pipeline_run_id);
+    const id = attemptForensicsRecordId(attempt, input.work_retry_ordinal);
     const row = this.#db.prepare(`
       SELECT * FROM records
       WHERE id = ? AND pipeline_run_id = ? AND kind = 'decision'
@@ -732,11 +735,16 @@ export class SqliteKernelStore implements
       record.id,
       record.payload.blob,
     );
-    const payload = parseAttemptForensicsPayload(
+    const payload = validateAttemptForensicsPayload(
       parseJson(bytes.toString("utf8"), `record ${id} blob`),
-    );
+      { source: "attempt_forensics" },
+    ).value;
     if (
-      payload.pipeline_run_id !== input.pipeline_run_id || payload.attempt_id !== input.attempt_id
+      payload.pipeline_run_id !== input.pipeline_run_id || payload.attempt_id !== input.attempt_id ||
+      payload.request_hash !== attempt.request_hash ||
+      payload.definition_bundle_hash !== attempt.definition_bundle_hash ||
+      payload.work_retry_ordinal !== input.work_retry_ordinal ||
+      record.created_at !== payload.observed_at
     ) throw new Error(`record ${id} changed its Attempt forensics identity`);
     return { record, payload };
   }
@@ -1063,6 +1071,15 @@ export class SqliteKernelStore implements
           SELECT context.value
           FROM selected_attempts, json_each(selected_attempts.context_record_ids_json) AS context
           WHERE context.type = 'text'
+          UNION
+          SELECT decision_input.value
+          FROM selected_attempts
+          JOIN records AS settlement_decision
+            ON settlement_decision.id = selected_attempts.decision_record_id
+            AND settlement_decision.pipeline_run_id = selected_attempts.pipeline_run_id
+            AND settlement_decision.kind = 'decision'
+          JOIN json_each(settlement_decision.input_record_ids_json) AS decision_input
+          WHERE decision_input.type = 'text'
         )
         SELECT records.* FROM records
         JOIN referenced_ids ON referenced_ids.id = records.id
@@ -1113,6 +1130,12 @@ export class SqliteKernelStore implements
         result.input_subject !== attempt.input_subject || result.output_subject !== attempt.output_subject ||
         !decision.input_record_ids.includes(result.id)
       ) throw new Error(`settled structured attempt ${attempt.id} has a cross-attempt decision relation`);
+      const decisionInputRecords = this.#materializeExactRecords(
+        request.pipeline_run_id,
+        decision.input_record_ids,
+        run.status,
+        recordsById,
+      );
       const checkpoint = this.#materializeExactCheckpoints(
         request.pipeline_run_id,
         [attempt.checkpoint_id],
@@ -1135,6 +1158,8 @@ export class SqliteKernelStore implements
         attempt,
         result,
         decision,
+        decision_input_records: [...decisionInputRecords.values()]
+          .sort((left, right) => compareCodeUnits(left.id, right.id)),
         checkpoint,
         request_inputs: {
           task_prompt: taskPrompt,
@@ -1365,7 +1390,10 @@ export class SqliteKernelStore implements
     if (!row) throw new Error(`unknown attempt ${id} for pipeline run ${runId}`);
     const attempt = attemptFromRow(row);
     const evidence = attempt.pending_result?.invalid_result_evidence;
-    if (evidence) this.#readBlob(runId, "attempt", attempt.id, evidence);
+    if (evidence) {
+      const bytes = this.#readBlob(runId, "attempt", attempt.id, evidence);
+      this.#assertInvalidResultEvidenceIdentity(attempt, evidence, bytes);
+    }
     return attempt;
   }
 
@@ -1523,11 +1551,15 @@ export class SqliteKernelStore implements
     if (changed.changes !== 1) throw new Error(`attempt ${write.attempt_id} terminal compare-and-set failed`);
   }
 
-  #insertRecord(recordInput: ExecutionRecord, replacementOwner?: KernelAttempt): void {
+  #insertRecord(
+    recordInput: ExecutionRecord,
+    replacementOwners: ReadonlyMap<string, KernelAttempt> = new Map(),
+  ): void {
     const record = validateExecutionRecord(recordInput, { payloadSchemas: this.#payloadSchemas }).value;
     const payload = this.#recordPayloadColumns(record.payload, record.payload_schema);
     if (record.kind === "result") {
-      const owner = replacementOwner ?? this.#attemptById(record.attempt_id, record.pipeline_run_id);
+      const owner = replacementOwners.get(record.attempt_id) ??
+        this.#attemptById(record.attempt_id, record.pipeline_run_id);
       if (
         owner.id !== record.attempt_id || owner.pipeline_run_id !== record.pipeline_run_id ||
         owner.request_hash !== record.request_hash || owner.definition_bundle_hash !== record.definition_bundle_hash ||
@@ -1535,6 +1567,7 @@ export class SqliteKernelStore implements
       ) throw new Error(`ResultRecord ${record.id} does not match its attempt identity`);
     }
     if (record.kind === "decision") {
+      this.#assertAttemptEvidenceRecord(record, replacementOwners);
       for (const inputId of record.input_record_ids) {
         const input = this.#db.prepare("SELECT pipeline_run_id FROM records WHERE id = ?").get(inputId) as
           | { pipeline_run_id: string }
@@ -1729,11 +1762,132 @@ export class SqliteKernelStore implements
     ]);
   }
 
+  #assertAttemptEvidenceRecord(
+    record: DecisionRecord,
+    replacementOwners: ReadonlyMap<string, KernelAttempt>,
+  ): void {
+    if (
+      record.reducer !== ATTEMPT_FORENSICS_REDUCER &&
+      record.reducer !== INVALID_RESULT_EVIDENCE_REDUCER
+    ) return;
+    if (record.input_record_ids.length !== 0 || !("blob" in record.payload)) {
+      throw new Error(`attempt evidence Record ${record.id} is not an immutable blob leaf`);
+    }
+    const pointer = record.payload.blob;
+    const token = this.#blobs.verify(pointer);
+    const bytes = this.#blobs.read(pointer);
+    this.#blobs.assertToken(token, pointer);
+    if (record.reducer === INVALID_RESULT_EVIDENCE_REDUCER) {
+      const parsed = validateInvalidResultEvidencePayload(
+        parseJson(Buffer.from(bytes).toString("utf8"), `record ${record.id} blob`),
+        { source: `record ${record.id} invalid_result_evidence` },
+      ).value;
+      const replacement = replacementOwners.get(parsed.attempt_id);
+      const replacementOwnsPointer = replacement?.pending_result?.invalid_result_evidence !== null &&
+        replacement?.pending_result?.invalid_result_evidence !== undefined &&
+        canonicalJson(replacement.pending_result.invalid_result_evidence) === canonicalJson(pointer);
+      // A result_pending replacement is the authoritative source for the new
+      // candidate/diagnostic binding. Terminal replacements deliberately clear
+      // pending_result, so evidence observed by the finishing lease must be
+      // validated against the still-current persisted Attempt instead.
+      const owner = replacementOwnsPointer
+        ? replacement
+        : this.#attemptById(parsed.attempt_id, parsed.pipeline_run_id);
+      const payload = this.#assertInvalidResultEvidenceIdentity(owner, pointer, bytes);
+      assertExactInvalidResultEvidenceRecord({ attempt: owner, pointer, record });
+      if (record.created_at !== payload.observed_at) {
+        throw new Error(`record ${record.id} changed its invalid-result observation time`);
+      }
+      return;
+    }
+    if (
+      pointer.encoding !== "utf-8" || pointer.media_type !== "application/json" ||
+      pointer.payload_schema !== record.payload_schema
+    ) throw new Error(`record ${record.id} Attempt forensics pointer is not canonical JSON`);
+    const payload = validateAttemptForensicsPayload(
+      parseJson(Buffer.from(bytes).toString("utf8"), `record ${record.id} blob`),
+      { source: `record ${record.id} attempt_forensics` },
+    ).value;
+    const owner = this.#attemptById(payload.attempt_id, payload.pipeline_run_id);
+    const lease = owner.lease;
+    if (
+      record.id !== attemptForensicsRecordId(owner, payload.work_retry_ordinal) ||
+      record.payload_schema !== payload.schema || record.pipeline_run_id !== owner.pipeline_run_id ||
+      payload.request_hash !== owner.request_hash ||
+      payload.definition_bundle_hash !== owner.definition_bundle_hash ||
+      payload.work_retry_ordinal !== owner.work_retry_ordinal ||
+      !lease || payload.lease_id !== lease.id || !lease.started ||
+      record.created_at !== payload.observed_at
+    ) throw new Error(`record ${record.id} changed its live Attempt forensics identity`);
+  }
+
   #preverifyAttemptBlobs(attempts: readonly KernelAttempt[]): void {
     for (const attempt of attempts) {
       const evidence = attempt.pending_result?.invalid_result_evidence;
-      if (evidence) this.#blobs.assertToken(this.#blobs.verify(evidence), evidence);
+      if (!evidence) continue;
+      const token = this.#blobs.verify(evidence);
+      const bytes = this.#blobs.read(evidence);
+      this.#assertInvalidResultEvidenceIdentity(attempt, evidence, bytes);
+      this.#blobs.assertToken(token, evidence);
     }
+  }
+
+  #assertInvalidResultEvidenceIdentity(
+    attempt: KernelAttempt,
+    pointer: BlobPointer,
+    bytes: Uint8Array,
+  ): InvalidResultEvidencePayload {
+    if (
+      pointer.encoding !== "utf-8" || pointer.media_type !== "application/json" ||
+      pointer.payload_schema !== INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA
+    ) throw new Error(`attempt ${attempt.id} invalid-result evidence pointer is not canonical JSON`);
+    const payload = validateInvalidResultEvidencePayload(
+      parseJson(Buffer.from(bytes).toString("utf8"), `attempt ${attempt.id} invalid-result evidence`),
+      { source: `attempt ${attempt.id} invalid_result_evidence` },
+    ).value;
+    const ownsPendingPointer = attempt.pending_result?.invalid_result_evidence !== null &&
+      attempt.pending_result?.invalid_result_evidence !== undefined &&
+      canonicalJson(attempt.pending_result.invalid_result_evidence) === canonicalJson(pointer);
+    // Leasing result correction increments result_correction_count before it
+    // executes, while the pending pointer still describes the preceding
+    // invalid outcome. The first correction lease therefore legitimately
+    // carries phase=work evidence at count=1. Once a correction has produced
+    // another pending result, phase=result_correction is also valid.
+    const phaseMatches = ownsPendingPointer
+      ? payload.phase === "work" ||
+        (attempt.result_correction_count > 0 && payload.phase === "result_correction")
+      : attempt.lease?.started
+        ? payload.phase === attempt.lease.purpose
+        : false;
+    const identities = [
+      ["pipeline_run_id", payload.pipeline_run_id, attempt.pipeline_run_id],
+      ["attempt_id", payload.attempt_id, attempt.id],
+      ["request_hash", payload.request_hash, attempt.request_hash],
+      ["definition_bundle_hash", payload.definition_bundle_hash, attempt.definition_bundle_hash],
+      ...(ownsPendingPointer
+        ? [["candidate_hash", payload.candidate_hash, attempt.pending_result!.candidate_hash] as const]
+        : []),
+    ] as const;
+    const mismatch = identities.find(([, observed, expected]) => observed !== expected);
+    if (mismatch) {
+      throw new Error(
+        `attempt ${attempt.id} invalid-result evidence changed its sealed identity (${mismatch[0]})`,
+      );
+    }
+    if (!phaseMatches) {
+      throw new Error(
+        `attempt ${attempt.id} invalid-result evidence changed its sealed identity (phase)`,
+      );
+    }
+    if (
+      ownsPendingPointer &&
+      canonicalJson(payload.diagnostics) !== canonicalJson(attempt.pending_result!.diagnostics)
+    ) {
+      throw new Error(
+        `attempt ${attempt.id} invalid-result evidence changed its sealed identity (diagnostics)`,
+      );
+    }
+    return payload;
   }
 
   #loadExactRecords(

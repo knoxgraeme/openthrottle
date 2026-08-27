@@ -1,12 +1,19 @@
 import { createHash } from "node:crypto";
 import { Daytona, type Sandbox } from "@daytona/sdk";
 import {
+  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+  EVIDENCE_ARTIFACT_MAX_BYTES,
+  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   canonicalJson,
   digestCanonicalJson,
   jsonValueAt,
+  validateAttemptForensicsPayload,
   validateBlobPointer,
+  validateEvidenceArtifactDescriptor,
+  validateInvalidResultEvidencePayload,
   type BlobPointer,
   type EffectIntent,
+  type EvidenceArtifactDescriptor,
   type JsonValue,
 } from "@openthrottle/contracts";
 import type {
@@ -23,8 +30,6 @@ import type {
 } from "../../app/kernel-effect-ports.js";
 import {
   KERNEL_ACTION_REQUEST_SCHEMA,
-  ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
-  INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA,
   type KernelResultCorrectionRequest,
   type KernelRuntimeCompatibilityPort,
   type KernelRuntimeLeaseCallbacks,
@@ -43,17 +48,10 @@ import type {
 } from "../../pipeline/kernel/steering.js";
 import {
   KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES,
-  KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES,
   parseKernelRuntimeResult,
-  parseKernelEvidenceArtifactDescriptor,
   parseKernelSessionEvent,
   type KernelCheckpointArtifactDescriptor,
-  type KernelEvidenceArtifactDescriptor,
 } from "../../runtime/kernel-wire.js";
-import {
-  parseAttemptForensicsPayload,
-  parseInvalidResultEvidencePayload,
-} from "../../pipeline/kernel/attempt-evidence.js";
 import {
   inspectKernelCheckpointBundle,
   inspectKernelIntegrationBundle,
@@ -81,6 +79,7 @@ const KERNEL_STEERING_DELIVERY_SCHEMA = "openthrottle.kernel-steering/v1" as con
 const KERNEL_STEERING_DELIVERY_MAX_BYTES = 64 * 1024;
 const KERNEL_INTEGRATION_SEALED_BUNDLES_MAX_BYTES = KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES;
 const ACTIVE_AUTOSTOP_MINUTES = 60;
+const EVIDENCE_CLOCK_FUTURE_SKEW_MS = 5 * 60 * 1_000;
 const DISPATCH_LOCK_CONTENTION_EXIT_CODE = 75;
 const DAYTONA_EXECUTOR_GIT = [
   "env",
@@ -127,6 +126,13 @@ const INTEGRATION_ENV_FAMILY = [
 ] as const;
 const SAFE_PATH_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/;
 const KERNEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
+
+function assertTrustedEvidenceTimestamp(observedAt: string): void {
+  const observedMs = Date.parse(observedAt);
+  if (!Number.isFinite(observedMs) || observedMs > Date.now() + EVIDENCE_CLOCK_FUTURE_SKEW_MS) {
+    throw new Error("runtime evidence timestamp exceeds the supervisor clock bound");
+  }
+}
 
 interface DaytonaKernelOptions {
   snapshot: string;
@@ -837,6 +843,7 @@ export class DaytonaKernelAdapter implements
             request,
             paths.result_directory,
             descriptor,
+            callbacks,
           ),
         },
       });
@@ -844,23 +851,26 @@ export class DaytonaKernelAdapter implements
     const collectForensics = async () => {
       const raw = await downloadUtf8(sandbox, paths.forensics);
       if (raw === null) return null;
-      const descriptor = parseKernelEvidenceArtifactDescriptor(
-        JSON.parse(raw),
-        ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
-      );
+      const descriptor = validateEvidenceArtifactDescriptor(JSON.parse(raw), {
+        source: "attempt_forensics_descriptor",
+        payloadSchema: ATTEMPT_FORENSICS_PAYLOAD_SCHEMA,
+      }).value;
       const materialized = await this.#materializeArtifact(
         sandbox,
         request,
         paths.result_directory,
         descriptor,
+        callbacks,
       );
-      if (!("operational_signature" in materialized)) {
+      if (!("blob" in materialized) || !("evidence_payload" in materialized) ||
+          materialized.evidence_payload.schema !== ATTEMPT_FORENSICS_PAYLOAD_SCHEMA) {
         throw new Error("attempt forensics materialization omitted its operational signature");
       }
-      const { operational_signature: operationalSignature, ...blob } = materialized;
+      const payload = materialized.evidence_payload;
       return {
-        blob,
-        operational_signature: operationalSignature,
+        blob: materialized.blob,
+        operational_signature: payload.operational_signature,
+        observed_at: payload.observed_at,
       };
     };
     await this.#refreshLeaseGenerationFence(sandbox, request, paths, callbacks.lease_generation);
@@ -913,6 +923,7 @@ export class DaytonaKernelAdapter implements
       OT_ACTION_FORENSICS_FILE: paths.forensics,
       OT_ACTION_RUNNER_STDOUT_FILE: paths.runner_stdout,
       OT_ACTION_RUNNER_STDERR_FILE: paths.runner_stderr,
+      OT_ACTION_WORK_RETRY_ORDINAL: String(callbacks.work_retry_ordinal),
       OT_LEASE_GENERATION_FENCE_FILE: paths.lease_generation_fence,
       OT_LEASE_GENERATION_LOCK_FILE: paths.lease_generation_lock,
     }, { unset });
@@ -1254,26 +1265,31 @@ export class DaytonaKernelAdapter implements
     sandbox: Sandbox,
     request: KernelWorkActionRequest | KernelResultCorrectionRequest,
     resultDirectory: string,
-    descriptor: KernelCheckpointArtifactDescriptor | KernelEvidenceArtifactDescriptor,
+    descriptor: KernelCheckpointArtifactDescriptor | EvidenceArtifactDescriptor,
+    launch: Pick<KernelRuntimeLeaseCallbacks, "lease_generation" | "work_retry_ordinal">,
   ) {
     const bytes = await sandbox.fs.downloadFile(`${resultDirectory}/${descriptor.file}`);
     if (
       bytes.byteLength !== descriptor.bytes ||
       bytes.byteLength > ("schema" in descriptor
-        ? KERNEL_EVIDENCE_ARTIFACT_MAX_BYTES
+        ? EVIDENCE_ARTIFACT_MAX_BYTES
         : KERNEL_CHECKPOINT_ARTIFACT_MAX_BYTES) ||
       createHash("sha256").update(bytes).digest("hex") !== descriptor.sha256
     ) throw new Error(`artifact for ${request.attempt_id} failed its sealed descriptor`);
     if ("schema" in descriptor) {
       const value = JSON.parse(bytes.toString("utf8"));
       if (descriptor.payload_schema === ATTEMPT_FORENSICS_PAYLOAD_SCHEMA) {
-        const payload = parseAttemptForensicsPayload(value);
+        const payload = validateAttemptForensicsPayload(value, {
+          source: "attempt_forensics_artifact",
+        }).value;
         if (
           payload.pipeline_run_id !== request.pipeline_run_id ||
           payload.attempt_id !== request.attempt_id || payload.request_hash !== request.request_hash ||
           payload.definition_bundle_hash !== request.definition_bundle_hash ||
-          payload.lease_id !== request.lease_id
+          payload.lease_id !== request.lease_id ||
+          payload.work_retry_ordinal !== launch.work_retry_ordinal
         ) throw new Error("attempt forensics changed its sealed request identity");
+        assertTrustedEvidenceTimestamp(payload.observed_at);
         const pointer = this.#options.blob_store.put({
           bytes,
           encoding: "utf-8",
@@ -1281,24 +1297,28 @@ export class DaytonaKernelAdapter implements
           payload_schema: descriptor.payload_schema,
           expected_digest: descriptor.sha256,
         }).pointer;
-        return { ...pointer, operational_signature: payload.operational_signature };
+        return { blob: pointer, evidence_payload: payload };
       }
       if (descriptor.payload_schema !== INVALID_RESULT_EVIDENCE_PAYLOAD_SCHEMA) {
         throw new Error("runtime evidence artifact schema is unsupported");
       }
-      const payload = parseInvalidResultEvidencePayload(value);
+      const payload = validateInvalidResultEvidencePayload(value, {
+        source: "invalid_result_evidence_artifact",
+      }).value;
       if (
         payload.pipeline_run_id !== request.pipeline_run_id || payload.attempt_id !== request.attempt_id ||
         payload.request_hash !== request.request_hash ||
         payload.definition_bundle_hash !== request.definition_bundle_hash || payload.phase !== request.phase
       ) throw new Error("invalid result evidence changed its sealed request identity");
-      return this.#options.blob_store.put({
+      assertTrustedEvidenceTimestamp(payload.observed_at);
+      const pointer = this.#options.blob_store.put({
         bytes,
         encoding: "utf-8",
         media_type: descriptor.media_type,
         payload_schema: descriptor.payload_schema,
         expected_digest: descriptor.sha256,
       }).pointer;
+      return { blob: pointer, evidence_payload: payload };
     }
     const completedWorkAuthority = request.schema === KERNEL_ACTION_REQUEST_SCHEMA
       ? request.repository_authority
