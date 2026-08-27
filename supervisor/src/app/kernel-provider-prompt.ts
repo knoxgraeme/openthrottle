@@ -262,7 +262,7 @@ export class KernelProviderPromptHandler {
         const deadline = Date.parse(event.created_at) + GITHUB_PRE_ADMISSION_STOP_GRACE_MS;
         if (!Number.isFinite(deadline)) return "dead";
         const admittedAt = Date.parse(run.admitted_at);
-        if (!Number.isFinite(admittedAt) || admittedAt > deadline) return "stale";
+        if (!Number.isFinite(admittedAt) || admittedAt >= deadline) return "stale";
         const origins = this.#inbox.listConsumedAt({
           source_provider: "github",
           kinds: GITHUB_ADMISSION_KINDS,

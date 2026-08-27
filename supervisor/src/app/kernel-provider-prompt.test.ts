@@ -619,6 +619,23 @@ describe("KernelProviderPromptHandler", () => {
     expect(test.requestRunControl).not.toHaveBeenCalled();
   });
 
+  it("settles a stop when its run was admitted exactly at the grace deadline", async () => {
+    const admittedAt = "2026-08-20T12:10:00.000Z";
+    const test = handler({
+      resolveRun: () => ({
+        pipeline_run_id: "run-1",
+        work_item_id: "work-1",
+        source_provider: "github",
+        source_reference: "owner/repo#188",
+        admitted_at: admittedAt,
+      }),
+      originGithubAdmissions: [githubOrigin({ consumed_at: admittedAt })],
+    });
+
+    await expect(test.value.handle(githubStop())).resolves.toBe("stale");
+    expect(test.requestRunControl).not.toHaveBeenCalled();
+  });
+
   it("settles a run-present pull-request stop before authorization", async () => {
     const authorizeGithubComment = vi.fn(async () => true);
     const test = handler({
