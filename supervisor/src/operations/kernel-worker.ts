@@ -68,9 +68,14 @@ export class KernelWorker {
     return new Date(this.#now().getTime() + delayMs).toISOString();
   }
 
-  async #executeLeasedAttempt(leased: LeasedAttemptView): Promise<boolean> {
+  async #executeLeasedAttempt(
+    leased: LeasedAttemptView,
+    onActivity?: () => void,
+  ): Promise<boolean> {
     try {
-      const result = await this.#ordinary.executeLeasedAttempt(leased);
+      const result = onActivity
+        ? await this.#ordinary.executeLeasedAttempt(leased, onActivity)
+        : await this.#ordinary.executeLeasedAttempt(leased);
       if (result.disposition === "idle") return false;
       if (result.disposition === "external_boundary") {
         await this.#external.executeLeasedAttempt(result.leased);
@@ -86,7 +91,7 @@ export class KernelWorker {
   }
 
   /** Performs a bounded fair pass. Every durable queue gets progress opportunity. */
-  async runCycle(signal?: AbortSignal): Promise<number> {
+  async runCycle(signal?: AbortSignal, onActivity?: () => void): Promise<number> {
     if (signal?.aborted) return 0;
     let progressed = 0;
     const recoveryFence = this.#fence("attempt-recovery");
@@ -95,9 +100,10 @@ export class KernelWorker {
       expires_at: recoveryFence.expires_at,
       limit: this.#cycleLimit,
     });
+    onActivity?.();
     for (const leased of recovered) {
       if (signal?.aborted) return progressed;
-      if (await this.#executeLeasedAttempt(leased)) progressed += 1;
+      if (await this.#executeLeasedAttempt(leased, onActivity)) progressed += 1;
     }
 
     for (let index = 0; index < this.#cycleLimit && !signal?.aborted; index += 1) {
@@ -178,7 +184,7 @@ export class KernelWorker {
         leasedAttempts.push(leased);
       }
       const executions = await Promise.all(
-        leasedAttempts.map((leased) => this.#executeLeasedAttempt(leased)),
+        leasedAttempts.map((leased) => this.#executeLeasedAttempt(leased, onActivity)),
       );
       progressed += executions.filter(Boolean).length;
     }

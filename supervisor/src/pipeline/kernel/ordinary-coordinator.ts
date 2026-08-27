@@ -430,7 +430,10 @@ export class OrdinaryKernelCoordinator {
     return { disposition: "consumed", run: aggregate.run };
   }
 
-  async executeLeasedAttempt(leased: LeasedAttemptView): Promise<OrdinaryKernelStep> {
+  async executeLeasedAttempt(
+    leased: LeasedAttemptView,
+    onActivity?: () => void,
+  ): Promise<OrdinaryKernelStep> {
     const claim = captureAttemptLeaseClaim(leased);
     let view = await this.#load(leased.run_id, leased.attempt.id);
     assertAttemptLeaseClaim(view, claim);
@@ -488,7 +491,7 @@ export class OrdinaryKernelCoordinator {
       });
       const outcome = await this.#runtime.correctResult(
         request,
-        this.#leaseCallbacks(attempt),
+        this.#leaseCallbacks(attempt, onActivity),
       );
       return this.#handleCorrectionOutcome({
         view: await this.#load(view.run.id, attempt.id),
@@ -516,7 +519,7 @@ export class OrdinaryKernelCoordinator {
     const lease = attempt.lease;
     if (!lease?.started) throw new Error("ordinary execution lost its started lease");
     const outcome = await this.#runtime.executeWork(request, {
-      ...this.#leaseCallbacks(attempt),
+      ...this.#leaseCallbacks(attempt, onActivity),
       on_session: stage.kind === "agent"
         ? async (nativeSessionId) => {
           await this.#runtimeSessions.bindRuntimeSession({
@@ -546,7 +549,10 @@ export class OrdinaryKernelCoordinator {
     });
   }
 
-  #leaseCallbacks(attempt: KernelAttempt): KernelRuntimeLeaseCallbacks {
+  #leaseCallbacks(
+    attempt: KernelAttempt,
+    onActivity?: () => void,
+  ): KernelRuntimeLeaseCallbacks {
     const lease = attempt.lease;
     if (!lease?.started) throw new Error("ordinary execution lost its started lease");
     return {
@@ -569,6 +575,7 @@ export class OrdinaryKernelCoordinator {
           renewed.purpose !== lease.purpose || renewed.started !== true ||
           renewed.expires_at !== expiresAt
         ) throw new Error("attempt lease heartbeat returned a mismatched fence");
+        onActivity?.();
       },
     };
   }

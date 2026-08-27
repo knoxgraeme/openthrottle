@@ -316,6 +316,11 @@ export function materializeResultSubmissionChannel({
   const providerSchemaPath = pathInside(root, join(root, "provider-result.schema.json"), "provider schema path");
   const candidatePath = pathInside(root, join(candidateRoot, "candidate.json"), "result candidate path");
   const rejectionPath = pathInside(root, join(candidateRoot, "rejected.json"), "result rejection path");
+  const providerFinalPath = pathInside(
+    root,
+    join(candidateRoot, "provider-final.json"),
+    "provider final result path",
+  );
   writeImmutableJsonSync(schemaPath, schema, "semantic result schema");
   writeImmutableJsonSync(
     providerSchemaPath,
@@ -330,6 +335,7 @@ export function materializeResultSubmissionChannel({
     provider_schema_path: providerSchemaPath,
     candidate_path: candidatePath,
     rejection_path: rejectionPath,
+    provider_final_path: providerFinalPath,
   };
 }
 
@@ -486,7 +492,7 @@ function isResultCandidateAttempt(value) {
     value.schema === RESULT_CANDIDATE_SCHEMA;
 }
 
-export function extractProviderResultCandidate(raw, engine) {
+function* providerOutputSources(raw, engine) {
   if (!["claude", "codex", "opencode"].includes(engine)) {
     throw new Error(`unsupported result provider ${engine}`);
   }
@@ -494,18 +500,30 @@ export function extractProviderResultCandidate(raw, engine) {
   if (Buffer.byteLength(raw, "utf8") > PROVIDER_OUTPUT_MAX_BYTES) {
     throw new Error(`provider result output exceeds ${PROVIDER_OUTPUT_MAX_BYTES} UTF-8 bytes`);
   }
-  const sources = [];
-  const whole = parsedProviderSource(raw);
-  if (isResultCandidateAttempt(whole)) sources.push(whole);
-  for (const line of raw.split("\n").map((entry) => entry.trim()).filter(Boolean)) {
+  for (const line of raw.split("\n")) {
+    const entry = line.trim();
+    if (!entry) continue;
     let event;
     try {
-      event = JSON.parse(line);
+      event = JSON.parse(entry);
     } catch {
       continue;
     }
-    sources.push(...providerEventSources(event, engine));
+    yield* providerEventSources(event, engine);
   }
+}
+
+export function extractProviderFinalOutput(raw, engine) {
+  let finalSource = null;
+  for (const source of providerOutputSources(raw, engine)) finalSource = source;
+  if (finalSource === null) return "";
+  return typeof finalSource === "string" ? finalSource : canonicalJson(finalSource);
+}
+
+export function extractProviderResultCandidate(raw, engine) {
+  const sources = [...providerOutputSources(raw, engine)];
+  const whole = parsedProviderSource(raw);
+  if (isResultCandidateAttempt(whole)) sources.unshift(whole);
   const candidates = [];
   for (const source of sources) {
     const parsed = parsedProviderSource(source);

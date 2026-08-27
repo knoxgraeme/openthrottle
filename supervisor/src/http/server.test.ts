@@ -26,6 +26,7 @@ import type {
   KernelOperatorEffectRejectionRequest,
   KernelOperatorEffectRejectionResult,
 } from "../pipeline/kernel/ports.js";
+import type { KernelWorkerHealthPort } from "../shared/kernel-worker-health.js";
 import { createServer } from "./server.js";
 
 const fixtures: FreshKernelFixture[] = [];
@@ -37,7 +38,10 @@ afterEach(() => {
   for (const fixture of fixtures.splice(0)) fixture.cleanup();
 });
 
-function setup(input: { linear_session_start?: KernelLinearSessionStartWakePort } = {}) {
+function setup(input: {
+  linear_session_start?: KernelLinearSessionStartWakePort;
+  worker_health?: KernelWorkerHealthPort;
+} = {}) {
   const fixture = freshKernelFixture();
   fixtures.push(fixture);
   seedKernelRun({ db: fixture.db, run_id: "run-active" });
@@ -137,6 +141,17 @@ function setup(input: { linear_session_start?: KernelLinearSessionStartWakePort 
       },
       service,
       repository_setup: repositorySetup,
+      worker_health: input.worker_health ?? {
+        snapshot: () => ({
+          ok: true,
+          worker: {
+            status: "healthy",
+            lastSuccessfulCycleAt: "2026-08-20T13:00:00.000Z",
+            consecutiveFailures: 0,
+            staleAfterSeconds: 120,
+          },
+        }),
+      },
       ...(input.linear_session_start
         ? { linear_session_start: input.linear_session_start }
         : {}),
@@ -165,7 +180,10 @@ function deferred() {
 describe("kernel-native HTTP surface", () => {
   it("serves health plus authenticated status, logs, analysis, and run control", async () => {
     const { app } = setup();
-    expect(await (await app.request("/healthz")).json()).toEqual({ ok: true });
+    expect(await (await app.request("/healthz")).json()).toMatchObject({
+      ok: true,
+      worker: { status: "healthy", consecutiveFailures: 0 },
+    });
     expect(await (await app.request("/capabilities", { headers: STATUS_HEADERS })).json())
       .toMatchObject({ limits: { maxConcurrentAttempts: 1 } });
     expect((await app.request("/runs/run-active/status")).status).toBe(401);
@@ -199,6 +217,33 @@ describe("kernel-native HTTP surface", () => {
       accepted: true,
       action: "stop",
       pipeline_run_id: "run-active",
+    });
+  });
+
+  it("returns a failing health check with an explicit disk-full condition", async () => {
+    const { app } = setup({
+      worker_health: {
+        snapshot: () => ({
+          ok: false,
+          condition: "disk_full",
+          message: "disk full",
+          worker: {
+            status: "unhealthy",
+            lastSuccessfulCycleAt: "2026-08-20T12:58:00.000Z",
+            consecutiveFailures: 120,
+            staleAfterSeconds: 120,
+          },
+        }),
+      },
+    });
+
+    const response = await app.request("/healthz");
+    expect(response.status).toBe(503);
+    expect(await response.json()).toMatchObject({
+      ok: false,
+      condition: "disk_full",
+      message: "disk full",
+      worker: { status: "unhealthy", consecutiveFailures: 120 },
     });
   });
 

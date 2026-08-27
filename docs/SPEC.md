@@ -620,7 +620,7 @@ Webhook endpoints verify provider HMAC before ingestion.
 
 | Method and path | Auth | Contract |
 |---|---|---|
-| `GET /healthz` | public | `{ok:true}` process liveness |
+| `GET /healthz` | public | worker-cycle liveness; `200` while current, `503` when stalled or disk-full |
 | `GET /capabilities` | status bearer | release, capability digest, capabilities, limits |
 | `GET /runs/:reference/status` | status bearer | run/cursor/Attempt/Effect projection |
 | `GET /runs/:reference/logs` | status bearer | stable cursor page across run, Attempt, Record, Effect, Checkpoint, inbox events |

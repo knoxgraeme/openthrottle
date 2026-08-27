@@ -38,6 +38,7 @@ import {
 } from "./operations/kernel-external-plans.js";
 import { createKernelExternalPlanBindings } from "./operations/kernel-plan-bindings.js";
 import { KernelWorker } from "./operations/kernel-worker.js";
+import { KernelWorkerMonitor } from "./operations/kernel-worker-monitor.js";
 import { createKernelHistoricalAnalysisStore } from "./persistence/kernel-analysis-store.js";
 import { SqliteKernelCodexAuthStore } from "./persistence/kernel-codex-auth-store.js";
 import { SqliteKernelInboxStore } from "./persistence/kernel-inbox-store.js";
@@ -244,6 +245,7 @@ async function main(): Promise<void> {
     cycle_limit: cfg.kernelCycleLimit,
     execution_width: cfg.executionWidth,
   });
+  const workerMonitor = new KernelWorkerMonitor({ worker });
 
   const service = new KernelHttpService({
     registrations,
@@ -315,6 +317,7 @@ async function main(): Promise<void> {
     },
     service,
     repository_setup: repositorySetup,
+    worker_health: workerMonitor,
     ...(linearSessionStart ? { linear_session_start: linearSessionStart } : {}),
   });
 
@@ -324,9 +327,7 @@ async function main(): Promise<void> {
     if (cycleRunning || abort.signal.aborted) return;
     cycleRunning = true;
     try {
-      await worker.runCycle(abort.signal);
-    } catch (error) {
-      console.error("[kernel-worker] cycle failed:", error);
+      await workerMonitor.runCycle(abort.signal);
     } finally {
       cycleRunning = false;
     }

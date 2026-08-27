@@ -8,6 +8,7 @@ import type { OrdinaryKernelCoordinator } from "../pipeline/kernel/ordinary-coor
 import type { KernelExternalBoundaryCoordinator } from "./kernel-external-boundary.js";
 import type { KernelEffectExecutionService } from "./kernel-effects.js";
 import { KernelWorker } from "./kernel-worker.js";
+import { KernelWorkerMonitor } from "./kernel-worker-monitor.js";
 
 const NOW = "2026-08-20T12:00:00.000Z";
 
@@ -99,6 +100,123 @@ function workerFixture(
 }
 
 describe("KernelWorker", () => {
+  it("marks repeated SQLITE_FULL cycle failures unhealthy and rate-limits error logs", async () => {
+    const fixture = workerFixture(async () => "consumed");
+    const sqliteFull = Object.assign(new Error("database or disk is full"), { code: "SQLITE_FULL" });
+    vi.mocked(fixture.attempts.recoverExpiredAttemptLeases).mockRejectedValue(sqliteFull);
+    const error = vi.fn();
+    const monitor = new KernelWorkerMonitor({
+      worker: fixture.worker,
+      now: () => new Date(NOW),
+      repeated_failure_log_interval: 3,
+      logger: { error },
+    });
+
+    await monitor.runCycle();
+    expect(monitor.snapshot()).toMatchObject({
+      ok: false,
+      condition: "disk_full",
+      message: "disk full",
+      worker: { status: "unhealthy", consecutiveFailures: 1 },
+    });
+    expect(error).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenLastCalledWith(expect.stringContaining(
+      "consecutive_failures=1, condition=disk_full): SQLITE_FULL: database or disk is full",
+    ));
+
+    await monitor.runCycle();
+    expect(error).toHaveBeenCalledOnce();
+    await monitor.runCycle();
+    expect(error).toHaveBeenCalledTimes(2);
+    expect(error).toHaveBeenLastCalledWith(expect.stringContaining("consecutive_failures=3"));
+  });
+
+  it("keeps successful cycles healthy and marks a frozen worker stale after the threshold", async () => {
+    const fixture = workerFixture(async () => "consumed", { initial_inbox_event: null });
+    let now = new Date(NOW);
+    const monitor = new KernelWorkerMonitor({
+      worker: fixture.worker,
+      now: () => now,
+      stale_after_ms: 120_000,
+    });
+
+    await monitor.runCycle();
+    now = new Date("2026-08-20T12:02:00.000Z");
+    expect(monitor.snapshot()).toMatchObject({ ok: true, worker: { status: "healthy" } });
+
+    now = new Date("2026-08-20T12:02:00.001Z");
+    expect(monitor.snapshot()).toMatchObject({
+      ok: false,
+      condition: "worker_stalled",
+      worker: { status: "unhealthy", lastSuccessfulCycleAt: NOW },
+    });
+  });
+
+  it("keeps an actively heartbeating long-running cycle healthy", async () => {
+    let now = new Date(NOW);
+    let cycleCount = 0;
+    let reportActivity: (() => void) | undefined;
+    let finishLongCycle: (() => void) | undefined;
+    const longCycleFinished = new Promise<void>((resolve) => {
+      finishLongCycle = resolve;
+    });
+    const monitor = new KernelWorkerMonitor({
+      worker: {
+        async runCycle(_signal?: AbortSignal, onActivity?: () => void) {
+          cycleCount += 1;
+          if (cycleCount === 1) return 0;
+          reportActivity = onActivity;
+          await longCycleFinished;
+          return 1;
+        },
+      },
+      now: () => now,
+      stale_after_ms: 120_000,
+    });
+
+    await monitor.runCycle();
+    now = new Date("2026-08-20T12:02:00.001Z");
+    const longCycle = monitor.runCycle();
+    reportActivity!();
+
+    now = new Date("2026-08-20T12:04:00.001Z");
+    expect(monitor.snapshot()).toMatchObject({
+      ok: true,
+      worker: { status: "healthy", lastSuccessfulCycleAt: NOW },
+    });
+
+    finishLongCycle!();
+    await longCycle;
+  });
+
+  it("does not let activity from a failed cycle refresh successful-cycle liveness", async () => {
+    let now = new Date(NOW);
+    let cycleCount = 0;
+    const monitor = new KernelWorkerMonitor({
+      worker: {
+        async runCycle(_signal?: AbortSignal, onActivity?: () => void) {
+          cycleCount += 1;
+          onActivity?.();
+          if (cycleCount > 1) throw new Error("late cycle failure");
+          return 1;
+        },
+      },
+      now: () => now,
+      stale_after_ms: 120_000,
+    });
+
+    await monitor.runCycle();
+    now = new Date("2026-08-20T12:01:00.000Z");
+    await monitor.runCycle();
+
+    now = new Date("2026-08-20T12:02:00.001Z");
+    expect(monitor.snapshot()).toMatchObject({
+      ok: false,
+      condition: "worker_stalled",
+      worker: { status: "unhealthy", lastSuccessfulCycleAt: NOW, consecutiveFailures: 1 },
+    });
+  });
+
   it("requeues a transient inbox handler failure with bounded backoff", async () => {
     const fixture = workerFixture(async () => { throw new Error("GitHub timed out"); });
 
