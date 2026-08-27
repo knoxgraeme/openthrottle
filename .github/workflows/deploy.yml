@@ -13,6 +13,10 @@ on:
         description: "Force a Daytona snapshot rebuild"
         type: boolean
         default: false
+      snapshot_only:
+        description: "Build the Daytona snapshot without deploying"
+        type: boolean
+        default: false
       deploy_supervisor:
         description: "Force a direct Fly supervisor deploy"
         type: boolean
@@ -65,7 +69,10 @@ jobs:
 
   snapshot:
     needs: changes
-    if: needs.changes.outputs.snapshot == 'true' || inputs.build_snapshot
+    if: >-
+      needs.changes.outputs.snapshot == 'true' ||
+      inputs.build_snapshot ||
+      inputs.snapshot_only
     runs-on: ubuntu-latest
     outputs:
       name: ${{ steps.build.outputs.name }}
@@ -94,6 +101,7 @@ jobs:
   deploy:
     needs: [changes, snapshot]
     if: >-
+      (github.event_name != 'workflow_dispatch' || inputs.snapshot_only != true) &&
       vars.FRESH_EPOCH_INITIALIZED == 'true' &&
       always() && !cancelled() && needs.snapshot.result != 'failure' &&
       (needs.changes.outputs.supervisor == 'true' ||
