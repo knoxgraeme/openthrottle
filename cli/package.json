@@ -39,8 +39,8 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
-    "@clack/prompts": "^0.10.0",
-    "@daytona/sdk": "^0.199.0",
+    "@clack/prompts": "^1.7.0",
+    "@daytona/sdk": "^0.207.0",
     "@openthrottle/contracts": "file:../contracts",
     "skillfish": "1.0.39",
     "yaml": "^2.6.1"
@@ -56,7 +56,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "@vitest/coverage-v8": "^3.2.4",
+    "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.9.3",
     "vitest": "^3.2.4"
   }
