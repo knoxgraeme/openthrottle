@@ -10,6 +10,6 @@
     "test": "vitest run runner/*.test.mjs bin/*.test.mjs tests/*.test.mjs"
   },
   "devDependencies": {
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.11"
   }
 }
