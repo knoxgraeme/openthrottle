@@ -45,7 +45,10 @@ const stage: CompiledAgentPipelineStage = {
   },
 };
 
-function reviewResult(severity: "P0" | "P1" | "P2" | "P3"): ResultRecord {
+function reviewResult(
+  severity: "P0" | "P1" | "P2" | "P3" | null,
+  outcome = "success",
+): ResultRecord {
   return {
     schema: EXECUTION_RECORD_SCHEMA,
     id: `result-review-${severity}`,
@@ -63,10 +66,10 @@ function reviewResult(severity: "P0" | "P1" | "P2" | "P3"): ResultRecord {
       inline: {
         schema: SEMANTIC_RESULT_RECORD_PAYLOAD_SCHEMA,
         semantic_schema_id: reviewSchema.id,
-        outcome: "success",
+        outcome,
         payload: {
           summary: "reviewed",
-          findings: [{
+          findings: severity === null ? [] : [{
             severity,
             path: "src/example.ts",
             anchor: "example",
@@ -81,13 +84,20 @@ function reviewResult(severity: "P0" | "P1" | "P2" | "P3"): ResultRecord {
   };
 }
 
+function evaluateReview(
+  severity: "P0" | "P1" | "P2" | "P3" | null,
+  outcome = "success",
+) {
+  return new KernelEvaluatorRegistry().evaluateSemantic({
+    stage,
+    evaluation,
+    result: reviewResult(severity, outcome),
+  });
+}
+
 describe("KernelEvaluatorRegistry review findings", () => {
   it.each(["P0", "P1"] as const)("treats %s findings as blocking", (severity) => {
-    expect(new KernelEvaluatorRegistry().evaluateSemantic({
-      stage,
-      evaluation,
-      result: reviewResult(severity),
-    })).toEqual({
+    expect(evaluateReview(severity)).toEqual({
       evaluator: "core/review-outcome@1",
       outcome: "semantic_repair_required",
       reason: "blocking_review_finding",
@@ -95,13 +105,39 @@ describe("KernelEvaluatorRegistry review findings", () => {
   });
 
   it.each(["P2", "P3"] as const)("treats %s findings as advisory", (severity) => {
-    expect(new KernelEvaluatorRegistry().evaluateSemantic({
-      stage,
-      evaluation,
-      result: reviewResult(severity),
-    })).toEqual({
+    expect(evaluateReview(severity)).toEqual({
       evaluator: "core/review-outcome@1",
       outcome: "success",
+      reason: "validated_semantic_result",
+    });
+  });
+
+  it.each(["P2", "P3"] as const)(
+    "downgrades failure with only %s findings to success",
+    (severity) => {
+      expect(evaluateReview(severity, "failure")).toEqual({
+        evaluator: "core/review-outcome@1",
+        outcome: "success",
+        reason: "advisory_review_failure_downgraded",
+      });
+    },
+  );
+
+  it.each(["P0", "P1"] as const)(
+    "routes failure with a %s finding to semantic repair",
+    (severity) => {
+      expect(evaluateReview(severity, "failure")).toEqual({
+        evaluator: "core/review-outcome@1",
+        outcome: "semantic_repair_required",
+        reason: "blocking_review_finding",
+      });
+    },
+  );
+
+  it("preserves failure when the review could not produce findings", () => {
+    expect(evaluateReview(null, "failure")).toEqual({
+      evaluator: "core/review-outcome@1",
+      outcome: "failure",
       reason: "validated_semantic_result",
     });
   });

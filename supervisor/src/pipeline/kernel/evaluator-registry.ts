@@ -317,6 +317,32 @@ function admissionReviewOutcome(payload: SemanticResultRecordPayload): Evaluated
   };
 }
 
+function reviewOutcome(payload: SemanticResultRecordPayload): EvaluatedKernelResult {
+  const findings = semanticObject(payload.payload, "review result payload").findings;
+  if (!Array.isArray(findings)) {
+    throw new Error("review result payload findings must be an array");
+  }
+  if (hasBlockingReviewFinding(findings as unknown as readonly ReviewFindingV1[])) {
+    return {
+      evaluator: "core/review-outcome@1",
+      outcome: "semantic_repair_required",
+      reason: "blocking_review_finding",
+    };
+  }
+  if (payload.outcome === "failure" && findings.length > 0) {
+    return {
+      evaluator: "core/review-outcome@1",
+      outcome: "success",
+      reason: "advisory_review_failure_downgraded",
+    };
+  }
+  return {
+    evaluator: "core/review-outcome@1",
+    outcome: payload.outcome,
+    reason: "validated_semantic_result",
+  };
+}
+
 function inlineResultPayload(record: ResultRecord): SemanticResultRecordPayload | CommandResultRecordPayload {
   if (!("inline" in record.payload)) {
     throw new Error(`result ${record.id} must be materialized before live evaluation`);
@@ -360,19 +386,13 @@ export class KernelEvaluatorRegistry {
     if (input.evaluation.evaluator === "core/admission-review-outcome@1") {
       return admissionReviewOutcome(payload);
     }
-    const reviewFindings = input.evaluation.evaluator === "core/review-outcome@1"
-      ? semanticObject(payload.payload, "review result payload").findings
-      : null;
-    if (reviewFindings !== null && !Array.isArray(reviewFindings)) {
-      throw new Error("review result payload findings must be an array");
+    if (input.evaluation.evaluator === "core/review-outcome@1") {
+      return reviewOutcome(payload);
     }
-    const blocking = reviewFindings !== null && hasBlockingReviewFinding(
-      reviewFindings as unknown as readonly ReviewFindingV1[],
-    );
     return {
       evaluator: input.evaluation.evaluator,
-      outcome: blocking ? "semantic_repair_required" : payload.outcome,
-      reason: blocking ? "blocking_review_finding" : "validated_semantic_result",
+      outcome: payload.outcome,
+      reason: "validated_semantic_result",
     };
   }
 
