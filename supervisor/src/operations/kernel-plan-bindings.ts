@@ -104,6 +104,14 @@ function branch(runId: string, sourceReference: string): string {
   return `ot/${slug}-${digestCanonicalJson({ run_id: runId }).slice(0, 12)}`;
 }
 
+function pullRequestTitle(title: string, sourceReference: string): string {
+  const reference = sourceReference.length <= 200
+    ? sourceReference
+    : `${sourceReference.slice(0, 183)}-${digestCanonicalJson({ source_reference: sourceReference }).slice(0, 16)}`;
+  const suffix = ` (${reference})`;
+  return `${title.slice(0, 256 - suffix.length)}${suffix}`;
+}
+
 interface PublicationAnchor {
   subject: string;
   ref_mode: "create" | "update";
@@ -648,7 +656,7 @@ export function createKernelExternalPlanBindings(input: {
               branch: taskBranch,
               base_branch: environment.base_branch,
               expected_head_subject: output,
-              title: environment.title.slice(0, 256),
+              title: pullRequestTitle(environment.title, environment.source_reference),
               body: `OpenThrottle execution ${run.id} for ${environment.source_reference}.`,
               ownership_marker: `openthrottle:run:${digestCanonicalJson({ run_id: run.id })}`,
             },

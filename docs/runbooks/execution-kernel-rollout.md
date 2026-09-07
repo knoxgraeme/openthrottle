@@ -238,6 +238,31 @@ curl -fsS -X POST \
   "https://$FLY_APP.fly.dev/maintenance/open"
 ```
 
+Before accepting the first harness PR, configure the registered GitHub
+repository's merge settings:
+
+1. Enable squash merging and disable merge commits and rebase merging, making
+   squash merge the only available repository merge method.
+2. Set **Default commit message** to **Pull request title** (or **Pull request
+   title and description** if the repository intentionally includes the PR
+   body in squash commits).
+
+OpenThrottle builds each harness PR title from the sealed work-item title and
+source reference, for example `fix(publication): preserve merge identity
+(OPE-222)`. Merge every `ot/*` PR with **Squash and merge** and do not replace
+that generated squash title. Rebase-merging or fast-forwarding copies the
+deterministic checkpoint commit's generic message and epoch-zero timestamp onto
+the base branch. After the merge, verify both the change and ticket are visible:
+
+```bash
+git fetch origin main
+git log -1 --oneline origin/main
+```
+
+The entry must contain the PR's change title and source reference. Treat a
+generic `OpenThrottle integrated checkpoint` entry as a merge-configuration or
+operator-flow failure before merging another harness PR.
+
 Submit one real, scoped bug-fix ticket. Treat failures as dogfood findings and
 fix them forward. Local harnesses do not claim to prove live publication,
 provider evidence, semantic remediation, or terminal provider cleanup; real

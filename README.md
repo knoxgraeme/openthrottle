@@ -80,6 +80,15 @@ directories, installs the global planning/operator skills, registers the
 repository route, and verifies the runtime snapshot. Commit the definition tree
 before validation or shipping; compilation always reads exact Git bytes.
 
+Configure every registered GitHub repository to allow squash merging only and
+set **Default commit message** to **Pull request title**. OpenThrottle PR titles
+include the sealed work-item title and source reference, such as
+`fix(publication): preserve merge identity (OPE-222)`. Always squash-merge
+`ot/*` branches; rebase-merge or fast-forwarding exposes the deliberately
+generic, epoch-dated checkpoint commit on the base branch instead of the
+merge-facing PR title. The complete operator flow is in the
+[fresh-epoch runbook](docs/runbooks/execution-kernel-rollout.md#5-register-open-ingress-and-dogfood).
+
 For Linear control:
 
 ```bash
